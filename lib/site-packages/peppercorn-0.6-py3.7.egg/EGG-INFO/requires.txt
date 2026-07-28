@@ -1,0 +1,4 @@
+
+[docs]
+Sphinx>=1.7.6
+pylons-sphinx-themes

@@ -1,0 +1,45 @@
+{
+    "ljlpt": {
+        "LJL_TENTANT_ID": "",
+        "LJL_CLIENT_ID": "",
+        "ELN": {
+            "sharepoint_host": ""
+        },
+        "apiUrl": "",
+        "redirectURL": "",
+        "postRedirectURL": "",
+        "init": "/app/ljl/init.js",
+        "ljsever": {
+            "ENV": {
+                "THUMPRINT": "",
+                "APP_CERT_PATH": "etc/ssl/certs/app.pem"
+            }
+        },
+        "menu": [
+            {
+                "label": "Home",
+                "path": "ljl/init.js"
+            }
+        ],
+        "data": [
+            {
+                "label": "RNASeq",
+                "script": "ljl/data/big-data.js",
+                "data": "/rnaseq",
+                "server": "/ionworks"
+            },
+            {
+                "label": "Splicing Models",
+                "script": "ljl/screens/menu/splicing/test-loader.js",
+                "data": "/splicing",
+                "server": "/ionworks"
+            },
+            {
+                "label": "Constrained Elements",
+                "script": "ljl/data/conservation-data.js",
+                "data": "conservation",
+                "server": "/ionworks"
+            }
+        ]
+    }
+}
