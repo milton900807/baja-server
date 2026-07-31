@@ -6072,6 +6072,15 @@ function buildPythonEnv(req: any) {
         // Python runtime behavior
         // ----------------------------
         PYTHONUNBUFFERED: "1",
+
+        // Make the bundled `ion` library (py/ion-lib, a namespace package) importable
+        // by every python script we spawn, without a separate pip install. Prepend it
+        // so it wins over any stale/partial `ion` install, and preserve any existing
+        // PYTHONPATH the process was launched with.
+        PYTHONPATH: [
+            path.resolve(String(wd || "."), "py", "ion-lib"),
+            process.env.PYTHONPATH || "",
+        ].filter(Boolean).join(path.delimiter),
     };
 
     // ----------------------------
@@ -6126,6 +6135,12 @@ app.get("/py___/:path*", async (req: any, res: any) => {
         BIGDATA_POLL_SEC: "2",
         BIGDATA_POLL_MAX_SEC: "600",
         BIGDATA_LOCK_TTL_SEC: "21600",
+
+        // Make the bundled `ion` library (py/ion-lib) importable without a pip install.
+        PYTHONPATH: [
+            path.resolve(String(wd || "."), "py", "ion-lib"),
+            process.env.PYTHONPATH || "",
+        ].filter(Boolean).join(path.delimiter),
     };
 
     // Validate required env vars BEFORE spawning python

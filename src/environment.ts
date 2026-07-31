@@ -4,7 +4,7 @@ const fs = require("fs");
 const chalk = require("chalk");
 
 
-let trailscriptPath = '../ljlapps';
+let trailscriptPath = '../baja-apps';
 
 export class EnvConfig {
   static properties = EnvConfig.loadProperties();
@@ -14,8 +14,8 @@ export class EnvConfig {
 
   static loadProperties() {
     try {
-      if (!fs.existsSync(trailscriptPath+'/flexigraph')) {
-        trailscriptPath = '/ljl';
+      if (!fs.existsSync(trailscriptPath + '/flexigraph')) {
+        trailscriptPath = '/baja';
       }
 
       const homedir = require("os").homedir();
