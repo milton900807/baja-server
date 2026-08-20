@@ -10,7 +10,7 @@ const secretKeyHex = "A4BA8B43795566F988FF8FCBC3016E70";
 const byteArray = Buffer.from(secretKeyHex, 'hex');
 
 const iv = createIVFromString('powers'); // 128-bit IV
-const ljUsersDir = path.join(homeDir, 'ljusers');
+const ljUsersDir = path.join(homeDir, 'baja-users');
 
 
 function createIVFromString(inputString) {

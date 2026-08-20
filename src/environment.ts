@@ -40,7 +40,7 @@ export class EnvConfig {
 }
 
 const homeDir = require("os").homedir();
-const ljUsersDir = path.join(homeDir, 'ljusers');
+const ljUsersDir = path.join(homeDir, 'baja-users');
 
 function ensureLjUsersDirectory(ljUsersDir: any) {
   try {
@@ -70,5 +70,11 @@ export const environment = {
   bigDataFilesPath: '/bd',
   configPath: trailscriptPath + '/config',
   userData: ljUsersDir,
-  ott_root: '/mnt/ott/genomes'
+  ott_root: '/mnt/ott/genomes',
+  // Root directory holding locally-built off-target 2-bit/seed indexes
+  // (one subdirectory per index name). Lives alongside the reference FASTAs so
+  // the download hook and the python search share one location. Override with
+  // OFFTARGET_INDEX_DIR.
+  offtarget_index_root: process.env.OFFTARGET_INDEX_DIR ||
+    path.resolve('reference_data/offtarget_index')
 };

@@ -124,13 +124,24 @@ interface TranscriptPayload {
     annotations: Annotation[];
     strand: string | null;
     reversedForNegativeStrand: boolean;
+    species?: string;
+    // True while this species' local reference is still downloading/indexing,
+    // so the client can tell the user the data came from the remote service.
+    referencesLoading?: boolean;
+    sequenceSource?: "cache" | "local" | "ensembl" | "none";
+    annotationSource?: "local" | "ensembl" | "none";
 }
 
-app.get('/transcript/:transcriptId', async (req, res) => {
+app.get(['/transcript/:transcriptId', '/api/ensembl/transcript/:transcriptId'], async (req, res) => {
     try {
         const { transcriptId } = req.params;
         const prefix = (req.query.prefix as string) || ENSEMBL_REST_BASE;
-        const species = String(req.query.species || 'human').trim().toLowerCase();
+        // Prefer an explicit species query param; otherwise infer it from the
+        // transcript id prefix (ENST=human, ENSMUST=mouse, ENSRNOT=rat).
+        const requestedSpecies = String(req.query.species || '').trim();
+        const species = normalizeSpecies(
+            requestedSpecies || speciesFromTranscriptId(transcriptId) || 'human'
+        );
         const useReverseComplement = req.query.reverseComplement === 'true';
 
         if (!transcriptId) {
@@ -161,6 +172,81 @@ app.get('/transcript/:transcriptId', async (req, res) => {
     }
 });
 
+// Server-side Ensembl proxies so the browser never calls rest.ensembl.org
+// directly (which is CORS-blocked). They reuse the same retry/failsafe fetch
+// helpers as the transcript endpoint.
+app.get(['/api/ensembl/lookup/:id', '/ensembl/lookup/:id'], async (req: any, res: any) => {
+    try {
+        const id = String(req.params.id || '');
+        const prefix = (req.query.prefix as string) || ENSEMBL_REST_BASE;
+        const lookup = await fetchTranscriptLookup(id, prefix);
+        return res.json(lookup);
+    } catch (error: any) {
+        return res.status(502).json({ error: error?.message || String(error) });
+    }
+});
+
+app.get(['/api/ensembl/sequence/:id', '/ensembl/sequence/:id'], async (req: any, res: any) => {
+    try {
+        const id = String(req.params.id || '');
+        const prefix = (req.query.prefix as string) || ENSEMBL_REST_BASE;
+        const seq = await fetchEnsemblSequence(id, prefix);
+        return res.type('text/plain').send(seq);
+    } catch (error: any) {
+        return res.status(502).json({ error: error?.message || String(error) });
+    }
+});
+
+// Proactively install (download + index) local reference data for a species, or
+// "all" for human/mouse/rat. Lets an operator warm the references so the first
+// transcript request doesn't pay the (potentially large) download cost.
+app.get('/reference/install/:species', async (req: any, res: any) => {
+    try {
+        const raw = String(req.params.species || 'all').trim().toLowerCase();
+        const targets = raw === 'all'
+            ? ['human', 'mouse', 'rat']
+            : [normalizeSpecies(raw)];
+
+        const report: any[] = [];
+        for (const sp of targets) {
+            if (!speciesRegistry[sp]) {
+                report.push({ species: sp, ok: false, error: 'not configured' });
+                continue;
+            }
+            try {
+                await loadSpeciesAnnotations(sp);
+                await loadSpeciesCdna(sp);
+                report.push({
+                    species: sp,
+                    ok: true,
+                    annotations: Object.keys(annotationsCache[sp] || {}).length,
+                    transcripts: Object.keys(cdnaCache[sp] || {}).length,
+                });
+            } catch (e: any) {
+                report.push({ species: sp, ok: false, error: e?.message || String(e) });
+            }
+        }
+        return res.json({ installed: report });
+    } catch (error: any) {
+        return res.status(500).json({ error: error?.message || String(error) });
+    }
+});
+
+// Which local references are currently downloaded + indexed in memory.
+app.get('/reference/status', (_req: any, res: any) => {
+    const status: Record<string, any> = {};
+    for (const sp of Object.keys(speciesRegistry)) {
+        status[sp] = {
+            annotationsLoaded: loadedSpecies.has(sp),
+            annotations: Object.keys(annotationsCache[sp] || {}).length,
+            cdnaLoaded: loadedCdna.has(sp),
+            transcripts: Object.keys(cdnaCache[sp] || {}).length,
+            hasCdnaConfig: !!speciesRegistry[sp].cdnaUrl,
+        };
+    }
+    res.json(status);
+});
+
 
 
 
@@ -181,6 +267,8 @@ const bigDataFilesPath = environment.bigDataFilesPath;
 const configPath = environment.configPath;
 const userData = environment.userData;
 const ott_root = environment.ott_root;
+const offtarget_index_root = path.resolve(
+    (environment as any).offtarget_index_root || 'reference_data/offtarget_index');
 
 
 let git: SimpleGit | null = null;
@@ -291,7 +379,7 @@ const annotationsCache: AnnotationCache = {};
 const scriptPath = '/ljconfig/util/set_env_vars.sh';
 fs.access(scriptPath, fs.constants.F_OK, (err: any) => {
     if (err) {
-        console.error(`Error: The script at ${scriptPath} does not exist or cannot be accessed.`);
+        // Optional deployment env-setup script; skip quietly when it's absent.
         return;
     }
     console.log(' Setting the environment variables ')
@@ -434,7 +522,13 @@ async function loadGFF3(filePath: string): Promise<Record<string, Annotation[]>>
             };
 
             for (const transcriptId of transcriptIds) {
-                const strippedId = stripDecimal(transcriptId);
+                // Ensembl GFF3 ids look like "transcript:ENSMUST00000..."; strip
+                // the "<type>:" prefix so keys match the bare stable id the client
+                // requests. GENCODE (human) ids have no colon and are unaffected.
+                const bare = transcriptId.includes(":")
+                    ? transcriptId.slice(transcriptId.lastIndexOf(":") + 1)
+                    : transcriptId;
+                const strippedId = stripDecimal(bare);
                 (annotations[strippedId] ??= []).push(annotation);
             }
         });
@@ -471,31 +565,76 @@ interface TranscriptPayload {
     annotations: Annotation[];
     strand: string | null;
     reversedForNegativeStrand: boolean;
+    species?: string;
+    // True while this species' local reference is still downloading/indexing,
+    // so the client can tell the user the data came from the remote service.
+    referencesLoading?: boolean;
+    sequenceSource?: "cache" | "local" | "ensembl" | "none";
+    annotationSource?: "local" | "ensembl" | "none";
 }
 
 const ENSEMBL_REST_BASE = "https://rest.ensembl.org";
 
 type SpeciesConfig = {
-    filePath: string;
-    remoteUrl: string;
+    filePath: string;        // GFF3 annotations (local path)
+    remoteUrl: string;       // GFF3 download url
+    cdnaPath?: string;       // transcript cDNA FASTA (local path)
+    cdnaUrl?: string;        // cDNA FASTA download url
+    ncrnaPath?: string;      // non-coding RNA FASTA (local path)
+    ncrnaUrl?: string;       // ncRNA FASTA download url
+    aliases?: string[];      // alternative names (Ensembl species name, assembly, ...)
 };
 
 type SpeciesRegistry = Record<string, SpeciesConfig>;
 type AnnotationCache = Record<string, Record<string, Annotation[]>>;
+
+const ENSEMBL_FTP = "https://ftp.ensembl.org/pub/release-110";
+
 const speciesRegistry: SpeciesRegistry = {
     human: {
-        filePath: "./reference_data/gencode.v46.basic.annotation.gff3.gz",
-        remoteUrl: "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_46/gencode.v46.basic.annotation.gff3.gz",
+        // GENCODE COMPREHENSIVE (all isoforms, every biotype) — the basic set
+        // and Ensembl cdna.all/ncrna omit minor isoforms (retained_intron,
+        // processed_transcript, NMD, …), which forced Ensembl REST fallbacks.
+        filePath: "./reference_data/human.gencode.annotation.gff3.gz",
+        remoteUrl: "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_46/gencode.v46.annotation.gff3.gz",
+        cdnaPath: "./reference_data/human.gencode.transcripts.fa.gz",
+        cdnaUrl: "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_46/gencode.v46.transcripts.fa.gz",
+        aliases: ["homo_sapiens", "hsapiens", "grch38", "hg38"],
+    },
+    mouse: {
+        filePath: "./reference_data/mouse.annotation.gff3.gz",
+        remoteUrl: `${ENSEMBL_FTP}/gff3/mus_musculus/Mus_musculus.GRCm39.110.gff3.gz`,
+        cdnaPath: "./reference_data/mouse.cdna.all.fa.gz",
+        cdnaUrl: `${ENSEMBL_FTP}/fasta/mus_musculus/cdna/Mus_musculus.GRCm39.cdna.all.fa.gz`,
+        ncrnaPath: "./reference_data/mouse.ncrna.fa.gz",
+        ncrnaUrl: `${ENSEMBL_FTP}/fasta/mus_musculus/ncrna/Mus_musculus.GRCm39.ncrna.fa.gz`,
+        aliases: ["mus_musculus", "mmusculus", "grcm39", "mm39", "mm10"],
+    },
+    rat: {
+        filePath: "./reference_data/rat.annotation.gff3.gz",
+        remoteUrl: `${ENSEMBL_FTP}/gff3/rattus_norvegicus/Rattus_norvegicus.mRatBN7.2.110.gff3.gz`,
+        cdnaPath: "./reference_data/rat.cdna.all.fa.gz",
+        cdnaUrl: `${ENSEMBL_FTP}/fasta/rattus_norvegicus/cdna/Rattus_norvegicus.mRatBN7.2.cdna.all.fa.gz`,
+        ncrnaPath: "./reference_data/rat.ncrna.fa.gz",
+        ncrnaUrl: `${ENSEMBL_FTP}/fasta/rattus_norvegicus/ncrna/Rattus_norvegicus.mRatBN7.2.ncrna.fa.gz`,
+        aliases: ["rattus_norvegicus", "rnorvegicus", "mratbn7", "rn7"],
     },
     yeast: {
         filePath: "./reference_data/yeast.annotation.gff3.gz",
         remoteUrl: "https://ftp.ensembl.org/pub/release-110/gff3/saccharomyces_cerevisiae/Saccharomyces_cerevisiae.R64-1-1.110.gff3.gz",
+        aliases: ["saccharomyces_cerevisiae", "s_cerevisiae", "scerevisiae"],
     },
     dog: {
         filePath: "./reference_data/dog.annotation.gff3.gz",
         remoteUrl: "https://ftp.ensembl.org/pub/release-110/gff3/canis_lupus_familiaris/Canis_lupus_familiaris.ROS_Cfam_1.0.110.gff3.gz",
+        aliases: ["canis_lupus_familiaris"],
     },
 };
+
+// Lazily-loaded per-species transcript cDNA index (stripped transcript id -> sequence).
+const cdnaCache: Record<string, Record<string, string>> = {};
+const loadedCdna = new Set<string>();
+const loadingCdna = new Map<string, Promise<void>>();
 // const annotationsCache: AnnotationCache = {};
 const sequenceCache: Record<string, string> = {};
 const loadedSpecies = new Set<string>();
@@ -539,6 +678,288 @@ function reverseComplement(seq: string): string {
         .reverse()
         .map(base => complement[base] ?? base)
         .join("");
+}
+
+// Map an incoming species label (common name, Ensembl name, assembly, ...) to a
+// registry key. Unknown values are returned as-is for the caller to validate.
+function normalizeSpecies(species: string | null | undefined): string {
+    if (!species) return "human";
+    const s = String(species).trim().toLowerCase();
+    if (speciesRegistry[s]) return s;
+    for (const key of Object.keys(speciesRegistry)) {
+        if ((speciesRegistry[key].aliases || []).includes(s)) return key;
+    }
+    return s;
+}
+
+// Infer species from an Ensembl transcript stable id prefix.
+//   ENST… = human, ENSMUST… = mouse, ENSRNOT… = rat.
+function speciesFromTranscriptId(transcriptId: string): string | null {
+    const id = String(transcriptId || "").toUpperCase();
+    if (id.startsWith("ENSMUST")) return "mouse";
+    if (id.startsWith("ENSRNOT")) return "rat";
+    if (id.startsWith("ENST")) return "human";
+    return null;
+}
+
+// Stream a (optionally gzipped) transcriptome cDNA FASTA into a
+// { strippedTranscriptId -> sequence } map without buffering the whole file.
+function loadCdnaFastaToMap(filePath: string): Promise<Record<string, string>> {
+    return new Promise((resolve, reject) => {
+        const map: Record<string, string> = {};
+        const fileStream = fs.createReadStream(filePath);
+        const input = filePath.endsWith(".gz")
+            ? fileStream.pipe(zlib.createGunzip())
+            : fileStream;
+        const rl = readline.createInterface({ input, crlfDelay: Infinity });
+
+        let currentId: string | null = null;
+        let chunks: string[] = [];
+
+        const flush = () => {
+            if (currentId && chunks.length) {
+                map[currentId] = chunks.join("");
+            }
+            chunks = [];
+        };
+
+        rl.on("line", (line: string) => {
+            if (line.startsWith(">")) {
+                flush();
+                // Ensembl header: ">ENST00000371953.8 cdna chromosome:..."
+                // GENCODE header: ">ENST00000371953.8|ENSG...|...|GENE|..."
+                const firstTok = line.slice(1).trim().split(/\s+/)[0] || "";
+                const idTok = firstTok.split("|")[0];   // GENCODE is pipe-delimited
+                currentId = stripDecimal(idTok);
+            } else if (currentId) {
+                chunks.push(line.trim());
+            }
+        });
+        rl.on("close", () => { flush(); resolve(map); });
+        rl.on("error", (err: Error) => reject(err));
+        fileStream.on("error", (err: Error) => reject(err));
+    });
+}
+
+// Ensure a species reference FASTA (cDNA or ncRNA) is present locally,
+// downloading it on demand. Returns the local path, or null if not configured.
+async function ensureFastaFile(
+    species: string,
+    localPath: string | undefined,
+    url: string | undefined,
+    label: string
+): Promise<string | null> {
+    if (!localPath || !url) return null;
+
+    const resolvedPath = path.resolve(localPath);
+    if (fileReadable(resolvedPath)) {
+        console.log(`[${label}] ${species}: file already present -> ${resolvedPath}`);
+        ensureOffTargetIndex(resolvedPath, deriveIndexName(species, label));
+        return resolvedPath;
+    }
+
+    ensureParentDirectory(resolvedPath);
+    console.log(`[${label}] ${species}: file missing, downloading from ${url}`);
+
+    let lastPct = -1;
+    await downloadToFileProgress(url, resolvedPath, {
+        onStart: (total) => {
+            console.log(
+                `[${label}] ${species}: download started` +
+                (total ? ` (${(total / 1024 / 1024).toFixed(2)} MB)` : "")
+            );
+        },
+        onProgress: (written, total) => {
+            if (!total) return;
+            const pct = Math.floor((written / total) * 100);
+            if (pct >= lastPct + 10 || pct === 100) {
+                lastPct = pct;
+                console.log(`[${label}] ${species}: ${pct}%`);
+            }
+        },
+        onDone: () => console.log(`[${label}] ${species}: download complete`),
+        onInfo: (msg) => console.log(`[${label}] ${species}: ${msg}`),
+    });
+
+    if (!fileReadable(resolvedPath)) {
+        throw new Error(`${label} for '${species}' downloaded but is unreadable`);
+    }
+    ensureOffTargetIndex(resolvedPath, deriveIndexName(species, label));
+    return resolvedPath;
+}
+
+// ---------------------------------------------------------------------------
+// Local off-target index management (2-bit + seed index) — see
+// baja-apps/py/sequence/offtarget/{build-index,search}.py.
+// ---------------------------------------------------------------------------
+
+// Legacy / UI-default genome names -> on-disk index directory names.
+// Keep in sync with _ALIASES in search.py.
+const OFFTARGET_ALIASES: Record<string, string> = {
+    "Homo_sapiens.GRCh38.88.3utr": "human_cdna",
+    "3UTR_human": "human_3utr",
+    "3UTR_mouse": "mouse_3utr",
+};
+
+function deriveIndexName(species: string, label: string): string {
+    return `${species}_${label}`.replace(/[^A-Za-z0-9._-]/g, "_");
+}
+
+function hasLocalIndex(name: string): boolean {
+    try {
+        return !!offtarget_index_root &&
+            fs.existsSync(path.join(offtarget_index_root, name, "meta.json"));
+    } catch { return false; }
+}
+
+// Map a requested genome name to a locally-built index dir name (or null).
+function resolveLocalIndexName(name: string): string | null {
+    const n = (name || "").trim();
+    if (hasLocalIndex(n)) return n;
+    const a = OFFTARGET_ALIASES[n];
+    if (a && hasLocalIndex(a)) return a;
+    return null;
+}
+
+// Fire-and-forget: build a 2-bit/seed index for a freshly-available FASTA.
+// No-op if an index (meta.json) already exists or a build is already running.
+function ensureOffTargetIndex(fastaPath: string, name: string): void {
+    try {
+        if (!offtarget_index_root) return;
+        const dir = path.join(offtarget_index_root, name);
+        if (fs.existsSync(path.join(dir, "meta.json"))) return;      // already built
+        const lock = dir + ".building";
+        if (fs.existsSync(lock)) return;                             // build in progress
+        fs.mkdirSync(offtarget_index_root, { recursive: true });
+        try { fs.writeFileSync(lock, String(Date.now())); } catch { }
+        const script = path.join(wd, "py/sequence/offtarget/build-index.py");
+        const env = buildPythonEnv({ protocol: "http", get: () => "" } as any);
+        console.log(`[offtarget] building index '${name}' from ${fastaPath}`);
+        const p = spawn("python3", ["-u", script, fastaPath, offtarget_index_root, name],
+            { env, detached: true, stdio: "ignore" });
+        const clearLock = () => { try { fs.unlinkSync(lock); } catch { } };
+        p.on("close", (code) => {
+            clearLock();
+            console.log(`[offtarget] index '${name}' build exited (${code})`);
+        });
+        p.on("error", (e) => { clearLock(); console.error("[offtarget] build spawn:", e); });
+        p.unref();
+    } catch (e) {
+        console.error("ensureOffTargetIndex:", e);
+    }
+}
+
+// Run the local off-target search (spawn search.py, parse its single
+// IONWORKS:RESOLUTION line synchronously) and resolve the oligoQuery result.
+async function runSearchLocal(
+    req: any, names: string[], oligos: any, k: number, strand: string, runMode: string
+): Promise<any> {
+    const argfile = path.join(os.tmpdir(),
+        `ott-${Date.now()}-${Math.floor(Math.random() * 1e6)}.json`);
+    fs.writeFileSync(argfile, JSON.stringify(
+        { "1": names, "2": oligos, "3": k, "4": strand, "5": runMode }));
+    const script = path.join(wd, "py/sequence/offtarget/search.py");
+    const env = buildPythonEnv(req);
+    return await new Promise((resolve) => {
+        const p = spawn("python3", ["-u", script, "jfile:" + argfile], { env });
+        let out = "";
+        p.stdout.on("data", (d) => { out += d.toString(); });
+        p.stderr.on("data", (d) => console.error("search.py: " + d));
+        p.on("close", () => {
+            try { fs.unlinkSync(argfile); } catch { }
+            const line = out.split("\n").find((l) => l.startsWith("IONWORKS:RESOLUTION:"));
+            try { resolve(line ? JSON.parse(line.split("\t")[1]) : { oligoQuery: [] }); }
+            catch { resolve({ oligoQuery: [] }); }
+        });
+        p.on("error", (e) => { console.error("search.py spawn:", e); resolve({ oligoQuery: [] }); });
+    });
+}
+
+// Startup diagnostic: confirm the python3 that runs the off-target search has
+// numpy (its only hard dependency), and report how many local indexes exist.
+function checkOffTargetPython(): void {
+    try {
+        let count = 0;
+        try {
+            if (offtarget_index_root && fs.existsSync(offtarget_index_root)) {
+                count = fs.readdirSync(offtarget_index_root).filter(
+                    (n) => fs.existsSync(path.join(offtarget_index_root, n, "meta.json"))).length;
+            }
+        } catch { }
+        console.log(`[offtarget] index dir: ${offtarget_index_root} (${count} local index${count === 1 ? "" : "es"})`);
+        const env = buildPythonEnv({ protocol: "http", get: () => "" } as any);
+        const p = spawn("python3",
+            ["-c", "import numpy,sys; sys.stdout.write(numpy.__version__)"], { env });
+        let out = "", err = "";
+        p.stdout.on("data", (d) => { out += d.toString(); });
+        p.stderr.on("data", (d) => { err += d.toString(); });
+        p.on("close", (code) => {
+            if (code === 0 && out.trim()) {
+                console.log(`[offtarget] python3 OK — numpy ${out.trim()}; local off-target search enabled`);
+            } else {
+                console.warn(
+                    "[offtarget] WARNING: the python3 used for off-target search is missing numpy — " +
+                    "local off-target search will fail and requests will fall back to the external worker. " +
+                    "Install it in that interpreter (e.g. `pip install numpy`)." +
+                    (err.trim() ? " Detail: " + err.trim() : ""));
+            }
+        });
+        p.on("error", (e: any) => {
+            console.warn("[offtarget] WARNING: could not run python3 for off-target search: " +
+                (e?.message || e) + " — local off-target search disabled (external-worker fallback).");
+        });
+    } catch (e) {
+        console.error("[offtarget] python check error:", e);
+    }
+}
+
+// Ensure + index a species' transcript sequences into memory (once), combining
+// the coding cDNA and non-coding RNA FASTAs so both coding and ncRNA transcripts
+// resolve locally. Species without configured FASTAs are marked loaded (empty)
+// so callers fall back to Ensembl gracefully.
+async function loadSpeciesCdna(species: string): Promise<void> {
+    if (loadedCdna.has(species)) return;
+
+    const inFlight = loadingCdna.get(species);
+    if (inFlight) { await inFlight; return; }
+
+    const p = (async () => {
+        const cfg = speciesRegistry[species];
+        const map: Record<string, string> = cdnaCache[species] || {};
+
+        const sources: [string | undefined, string | undefined, string][] = [
+            [cfg?.cdnaPath, cfg?.cdnaUrl, "cdna"],
+            [cfg?.ncrnaPath, cfg?.ncrnaUrl, "ncrna"],
+        ];
+
+        for (const [localPath, url, label] of sources) {
+            const filePath = await ensureFastaFile(species, localPath, url, label);
+            if (!filePath) continue;
+            console.log(`[${label}] ${species}: indexing transcript sequences into memory`);
+            const partial = await loadCdnaFastaToMap(filePath);
+            let added = 0;
+            for (const k in partial) {
+                if (!(k in map)) added++;
+                map[k] = partial[k];
+            }
+            console.log(
+                `[${label}] ${species}: indexed ${Object.keys(partial).length} sequences (+${added} new)`
+            );
+        }
+
+        cdnaCache[species] = map;
+        loadedCdna.add(species);
+        console.log(
+            `[transcripts] ${species}: ${Object.keys(map).length} total transcript sequences indexed`
+        );
+    })();
+
+    loadingCdna.set(species, p);
+    try {
+        await p;
+    } finally {
+        loadingCdna.delete(species);
+    }
 }
 
 async function ensureSpeciesFile(species: string): Promise<string> {
@@ -653,25 +1074,52 @@ async function initializeAnnotationCache(speciesToLoad?: string[]): Promise<void
     console.log(`[annotations] startup init complete`);
 }
 
+// Transient Ensembl statuses worth retrying (rate limit / overload / gateway).
+// 400 / 404 etc. are permanent (bad or retired id) and are NOT retried.
+const TRANSIENT_HTTP = new Set([429, 500, 502, 503, 504]);
+
+// Shared Ensembl fetch with retry + backoff on transient errors and network
+// blips. Returns the successful Response; throws with the last status once
+// retries are exhausted or the failure is permanent.
+async function ensemblFetch(
+    url: string,
+    headers: Record<string, string>,
+    maxAttempts = 3
+): Promise<any> {
+    let lastStatus = "";
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        let response: any;
+        try {
+            response = await fetch(url, { headers });
+        } catch (netErr: any) {
+            lastStatus = `network error: ${netErr?.message || netErr}`;
+            if (attempt < maxAttempts) {
+                await new Promise((r) => setTimeout(r, attempt * 1000));
+                continue;
+            }
+            break;
+        }
+
+        if (response.ok) return response;
+
+        lastStatus = `${response.status} ${response.statusText}`;
+        if (TRANSIENT_HTTP.has(response.status) && attempt < maxAttempts) {
+            const retryAfter = Number(response.headers.get("Retry-After")) || attempt;
+            await new Promise((r) => setTimeout(r, Math.min(retryAfter, 5) * 1000));
+            continue;
+        }
+        break;
+    }
+    throw new Error(`${lastStatus} (${url})`);
+}
+
 async function fetchEnsemblSequence(
     transcriptId: string,
     baseUrl: string = ENSEMBL_REST_BASE
 ): Promise<string> {
     const strippedId = stripDecimal(transcriptId);
     const url = `${baseUrl}/sequence/id/${encodeURIComponent(strippedId)}?type=cdna`;
-
-    const response = await fetch(url, {
-        headers: {
-            "Accept": "text/plain",
-        },
-    });
-
-    if (!response.ok) {
-        throw new Error(
-            `Failed to fetch sequence for ${transcriptId}: ${response.status} ${response.statusText}`
-        );
-    }
-
+    const response = await ensemblFetch(url, { Accept: "text/plain" });
     return (await response.text()).trim();
 }
 
@@ -696,22 +1144,8 @@ async function fetchTranscriptLookup(
 ): Promise<any> {
     const strippedId = stripDecimal(transcriptId);
     const url = `${baseUrl}/lookup/id/${encodeURIComponent(strippedId)}?expand=1`;
-
-    console.log(' url ' + url)
-
-    const response = await fetch(url, {
-        headers: {
-            Accept: "application/json",
-            "Content-Type": "application/json",
-        },
-    });
-
-    if (!response.ok) {
-        throw new Error(
-            `Failed transcript lookup for ${transcriptId}: ${response.status} ${response.statusText}`
-        );
-    }
-
+    // GET with only Accept — a Content-Type header on a GET can trigger a 400.
+    const response = await ensemblFetch(url, { Accept: "application/json" });
     return await response.json();
 }
 
@@ -785,11 +1219,20 @@ async function getTranscriptAnnotationsWithFallback(
 ): Promise<Annotation[]> {
     const strippedId = stripDecimal(transcriptId);
 
-    // Step 2: local annotations
-    await loadSpeciesAnnotations(species);
-    const localAnnotations = annotationsCache[species]?.[strippedId];
-    if (localAnnotations && localAnnotations.length > 0) {
-        return localAnnotations;
+    // Step 2: local annotations — but only if they are already downloaded and
+    // indexed in memory. If not, kick the download/index off in the background
+    // (idempotent) and fall back to Ensembl REST for THIS request instead of
+    // blocking on a potentially large / incomplete download+install.
+    if (loadedSpecies.has(species)) {
+        const localAnnotations = annotationsCache[species]?.[strippedId];
+        if (localAnnotations && localAnnotations.length > 0) {
+            return localAnnotations;
+        }
+    } else {
+        void loadSpeciesAnnotations(species).catch((e: any) =>
+            console.warn(`[annotations] ${species}: background load failed:`, e?.message || e)
+        );
+        console.log(`[annotations] ${species}: not ready yet, using Ensembl REST fallback`);
     }
 
     // Step 3: Ensembl REST fallback
@@ -804,14 +1247,75 @@ async function getTranscriptAnnotationsWithFallback(
         annotationsCache[species][strippedId] = restAnnotations;
 
         return restAnnotations;
-    } catch (exception) {
-
-        console.log(" array from failed ")
-        console.log({ message: exception.message });
-
+    } catch (exception: any) {
+        // Local miss + Ensembl REST unavailable (transient 5xx, or a
+        // retired/invalid id returning 400/404). Fail soft with no annotations;
+        // the caller still returns a well-formed (possibly empty) payload.
+        console.warn(
+            `[annotations] REST lookup unavailable for ${transcriptId}: ${exception?.message || exception}`
+        );
         return null;
     }
 }
+// Directory of bundled per-transcript sequence files (checked before Ensembl).
+// Files may be plain sequence or FASTA; layout is <dir>/<species>/<ENST>.<ext>
+// or <dir>/<ENST>.<ext>. Convention: the sequence is the transcript cDNA in the
+// same orientation Ensembl `type=cdna` returns (downstream strand handling is
+// applied uniformly).
+const LOCAL_SEQUENCE_DIR =
+    process.env.TRANSCRIPT_SEQ_DIR || "./reference_data/sequences";
+
+function readSequenceFile(filePath: string): string | null {
+    try {
+        if (!fileReadable(filePath)) return null;
+        const raw = fs.readFileSync(filePath, "utf-8");
+        const seq = raw
+            .split(/\r?\n/)
+            .filter((line) => !line.startsWith(">"))   // drop FASTA headers
+            .join("")
+            .replace(/\s+/g, "")
+            .trim();
+        return seq.length > 0 ? seq : null;
+    } catch {
+        return null;
+    }
+}
+
+async function getLocalTranscriptSequence(
+    transcriptId: string,
+    species: string
+): Promise<string | null> {
+    const strippedId = stripDecimal(transcriptId);
+
+    // 1. Bundled transcriptome cDNA — only if already downloaded and indexed.
+    //    If not ready, trigger the download/index in the background (idempotent)
+    //    and fall through (per-file, then Ensembl REST) rather than blocking on
+    //    an incomplete download+install.
+    if (loadedCdna.has(species)) {
+        const fromCdna = cdnaCache[species]?.[strippedId];
+        if (fromCdna && fromCdna.length > 0) return fromCdna;
+    } else {
+        void loadSpeciesCdna(species).catch((e: any) =>
+            console.warn(`[cdna] ${species}: background load failed:`, e?.message || e)
+        );
+        console.log(`[cdna] ${species}: not ready yet, using Ensembl REST fallback`);
+    }
+
+    // 2. Per-transcript sequence file convention.
+    const base = path.isAbsolute(LOCAL_SEQUENCE_DIR)
+        ? LOCAL_SEQUENCE_DIR
+        : path.resolve(process.cwd(), LOCAL_SEQUENCE_DIR);
+
+    const exts = ["txt", "seq", "fa", "fasta"];
+    for (const ext of exts) {
+        const scoped = readSequenceFile(path.join(base, species, `${strippedId}.${ext}`));
+        if (scoped) return scoped;
+        const flat = readSequenceFile(path.join(base, `${strippedId}.${ext}`));
+        if (flat) return flat;
+    }
+    return null;
+}
+
 async function getTranscriptSequenceAndAnnotations(
     transcriptId: string,
     species = "human",
@@ -821,11 +1325,21 @@ async function getTranscriptSequenceAndAnnotations(
     const strippedId = stripDecimal(transcriptId);
     const resultKey = annotationKey(species, transcriptId);
 
+    // Is this species' local reference still downloading / indexing?
+    const referencesLoading =
+        !loadedSpecies.has(species) || !loadedCdna.has(species);
+
     // Step 1: full transcript result cache
     const cachedResult = transcriptResultCache[resultKey];
     if (cachedResult) {
-        return cachedResult;
+        // Recompute the transient loading flag so it reflects current state.
+        return { ...cachedResult, species, referencesLoading };
     }
+
+    // Was the annotation already available locally (before the fallback runs)?
+    const hadLocalAnnotations =
+        loadedSpecies.has(species) &&
+        !!(annotationsCache[species]?.[strippedId]?.length);
 
     // Step 2 and 3: local annotations, then REST fallback
     const annotations =
@@ -835,12 +1349,38 @@ async function getTranscriptSequenceAndAnnotations(
             baseUrl
         )) ?? [];
 
-    const rawSequence = sequenceCache[resultKey]
-        ? sequenceCache[resultKey]
-        : await fetchEnsemblSequence(transcriptId, baseUrl).then((seq) => {
-              sequenceCache[resultKey] = seq;
-              return seq;
-          });
+    // Sequence: local first, then Ensembl. A failed Ensembl fetch (e.g. a
+    // persistent 503) must NOT abort the whole response — return the annotations
+    // so the client can still build the track; the sequence can be filled in
+    // on a later attempt.
+    let rawSequence = "";
+    let sequenceSource: "cache" | "local" | "ensembl" | "none" = "none";
+    if (sequenceCache[resultKey]) {
+        rawSequence = sequenceCache[resultKey];
+        sequenceSource = "cache";
+    } else {
+        // 1. Local: bundled cDNA index / per-transcript file, if present.
+        const localSequence = await getLocalTranscriptSequence(transcriptId, species);
+        if (localSequence) {
+            rawSequence = localSequence;
+            sequenceCache[resultKey] = rawSequence;
+            sequenceSource = "local";
+        } else {
+            // 2. Fall back to Ensembl REST (retries transient errors internally).
+            try {
+                rawSequence = await fetchEnsemblSequence(transcriptId, baseUrl);
+                sequenceCache[resultKey] = rawSequence;
+                sequenceSource = rawSequence ? "ensembl" : "none";
+            } catch (seqErr: any) {
+                console.warn(
+                    `Sequence fetch failed for ${transcriptId} (returning annotations only):`,
+                    seqErr?.message || seqErr
+                );
+                rawSequence = "";
+                sequenceSource = "none";
+            }
+        }
+    }
 
     let strand: string | null = null;
     if (annotations.length > 0) {
@@ -862,9 +1402,19 @@ async function getTranscriptSequenceAndAnnotations(
         annotations,
         strand,
         reversedForNegativeStrand: negativeStrand,
+        species,
+        referencesLoading,
+        sequenceSource,
+        annotationSource: hadLocalAnnotations
+            ? "local"
+            : (annotations.length > 0 ? "ensembl" : "none"),
     };
 
-    transcriptResultCache[resultKey] = payload;
+    // Only cache a complete payload; if the sequence was unavailable, leave it
+    // uncached so a later request can retry the Ensembl sequence fetch.
+    if (sequence && sequence.length > 0) {
+        transcriptResultCache[resultKey] = payload;
+    }
     return payload;
 }
 
@@ -3090,6 +3640,26 @@ const inputtemplate = input_directoryPath + '/';
 const resultstemplate = output_directoryPath + '/';
 
 
+// Genome list for the off-target UI. Returns an object whose keys are the
+// locally-available index names (the UI reads Object.keys() only), including
+// alias display names that resolve to a present index.
+app.get('/genomes', (_req: any, res: any) => {
+    const out: Record<string, any> = {};
+    try {
+        if (offtarget_index_root && fs.existsSync(offtarget_index_root)) {
+            for (const name of fs.readdirSync(offtarget_index_root)) {
+                if (fs.existsSync(path.join(offtarget_index_root, name, "meta.json"))) {
+                    out[name] = { name };
+                }
+            }
+        }
+    } catch (e) { console.error("/genomes:", e); }
+    for (const alias in OFFTARGET_ALIASES) {
+        if (out[OFFTARGET_ALIASES[alias]]) out[alias] = { name: OFFTARGET_ALIASES[alias], alias: true };
+    }
+    return res.json(out);
+});
+
 app.post('/off-targets-file', async (req, res) => {
     const uuid = Math.floor(Date.now() / 1000);
     const inputfile = inputtemplate + uuid + '.json';
@@ -3108,7 +3678,8 @@ app.post('/off-targets-file', async (req, res) => {
     if (!strand) {
         strand = '+-'
     }
-    if (!editDistance) {
+    // Note: 0 is a valid edit distance — only default when actually absent.
+    if (editDistance === undefined || editDistance === null || editDistance === '') {
         editDistance = '3'
     }
     if (!runMode && runMode.length === 0) {
@@ -3125,6 +3696,20 @@ app.post('/off-targets-file', async (req, res) => {
     }
     else {
         glist = [genomes]
+    }
+    // --- Local off-target service -----------------------------------------
+    // If every requested genome has a locally-built 2-bit/seed index, compute
+    // here via search.py instead of spooling to the external levenshtein
+    // worker. Any missing name falls through to the legacy spool path below.
+    try {
+        const localNames = glist.map((g: string) => resolveLocalIndexName(g));
+        if (localNames.length > 0 && localNames.every((n: string | null) => !!n)) {
+            const result = await runSearchLocal(
+                req, localNames as string[], sequence, +editDistance, strand, runMode);
+            return res.json(result);
+        }
+    } catch (e) {
+        console.error("local off-target failed, falling back to external worker:", e);
     }
     const glist_input = []
     for (const g of glist) {
@@ -4069,7 +4654,7 @@ app.get('/list-installed-files', async (req, res) => {
                 d.toString().toLowerCase().endsWith('.bam') ||
                 d.toString().toLowerCase().endsWith('.bam') ||
                 d.toString().toLowerCase().endsWith('.json') ||
-                d.toString().toLowerCase().endsWith('.screen') ||
+                d.toString().toLowerCase().endsWith('.baja') ||
                 d.toString().toLowerCase().endsWith('.vcf')
 
 
@@ -6056,6 +6641,7 @@ function buildPythonEnv(req: any) {
         USER_DATA: String(userData || ""),
         reference_db: String(process.env.reference_db || getReferenceDbPath() || ""),
         OTT_ROOT: String(ott_root || ""),
+        OFFTARGET_INDEX_DIR: String(offtarget_index_root || ""),
 
         // ----------------------------
         // Ion / BigData plumbing
@@ -6072,6 +6658,18 @@ function buildPythonEnv(req: any) {
         // Python runtime behavior
         // ----------------------------
         PYTHONUNBUFFERED: "1",
+
+        // ----------------------------
+        // AI / LLM credentials for python tools invoked through the js->py
+        // exec bridge (e.g. resolving Ensembl transcript IDs from a natural
+        // language user prompt via the Anthropic API). These are already
+        // covered by the `...process.env` spread above, but are set
+        // explicitly so the contract is guaranteed and self-documenting.
+        // Populate them via the server's .env file or shell environment.
+        // ----------------------------
+        ANTHROPIC_API_KEY: String(process.env.ANTHROPIC_API_KEY || ""),
+        ANTHROPIC_MODEL: String(process.env.ANTHROPIC_MODEL || ""),
+        OPENAI_API_KEY: String(process.env.OPENAI_API_KEY || ""),
 
         // Make the bundled `ion` library (py/ion-lib, a namespace package) importable
         // by every python script we spawn, without a separate pip install. Prepend it
@@ -6135,6 +6733,14 @@ app.get("/py___/:path*", async (req: any, res: any) => {
         BIGDATA_POLL_SEC: "2",
         BIGDATA_POLL_MAX_SEC: "600",
         BIGDATA_LOCK_TTL_SEC: "21600",
+
+        // AI / LLM credentials for python tools invoked through the js->py exec
+        // bridge (e.g. resolving Ensembl transcript IDs from a user prompt via
+        // the Anthropic API). Covered by `...process.env` above, set explicitly
+        // so the contract is guaranteed. Populate via the server .env / shell.
+        ANTHROPIC_API_KEY: String(process.env.ANTHROPIC_API_KEY || ""),
+        ANTHROPIC_MODEL: String(process.env.ANTHROPIC_MODEL || ""),
+        OPENAI_API_KEY: String(process.env.OPENAI_API_KEY || ""),
 
         // Make the bundled `ion` library (py/ion-lib) importable without a pip install.
         PYTHONPATH: [
@@ -8714,7 +9320,7 @@ async function refreshNewsList() {
                     return (
                         name.endsWith('.ljlpx') ||
                         name.endsWith('.ljl') ||
-                        name.endsWith('.screen')
+                        name.endsWith('.baja')
                     );
                 } catch (e) {
                     console.error('Error filtering file by extension:', fullPath, e);
@@ -8846,7 +9452,7 @@ async function refreshInternalNewsList() {
                     return (
                         name.endsWith('.ljlpx') ||
                         name.endsWith('.ljl') ||
-                        name.endsWith('.screen')
+                        name.endsWith('.baja')
                     );
                 } catch (e) {
                     console.error('Error filtering file by extension:', fullPath, e);
@@ -9441,8 +10047,70 @@ async function startServer() {
 startServer();
 
 
+// Warm local reference data (download + index) at startup when configured.
+// Set PRELOAD_REFERENCES to a comma list (e.g. "human,mouse,rat") or "all".
+// Runs in the background so it never blocks the server from accepting requests.
+async function preloadReferences(): Promise<void> {
+    const raw = String(process.env.PRELOAD_REFERENCES || "").trim();
+    if (!raw) return;
+
+    const list = raw.toLowerCase() === "all"
+        ? ["human", "mouse", "rat"]
+        : raw.split(",").map((s) => normalizeSpecies(s)).filter(Boolean);
+
+    const unique = Array.from(new Set(list));
+    if (unique.length === 0) return;
+    console.log(`[reference] preloading: ${unique.join(", ")}`);
+
+    for (const sp of unique) {
+        if (!speciesRegistry[sp]) {
+            console.warn(`[reference] preload: skipping unknown species '${sp}'`);
+            continue;
+        }
+        try {
+            console.log(`[reference] preload ${sp}: annotations...`);
+            await loadSpeciesAnnotations(sp);
+            console.log(`[reference] preload ${sp}: cDNA sequences...`);
+            await loadSpeciesCdna(sp);
+            console.log(
+                `[reference] preload ${sp}: ready ` +
+                `(${Object.keys(annotationsCache[sp] || {}).length} annotated transcripts, ` +
+                `${Object.keys(cdnaCache[sp] || {}).length} cDNA sequences)`
+            );
+        } catch (e: any) {
+            console.error(`[reference] preload ${sp} failed:`, e?.message || e);
+        }
+    }
+    console.log(`[reference] preload complete`);
+}
+
 server.listen(port, '0.0.0.0', () => {
     console.log(`Server running at http://0.0.0.0:${port}`);
+
+    // Verify the off-target python runtime (numpy) and report local indexes.
+    checkOffTargetPython();
+
+    // Always warm HUMAN references on startup (download + index if not already
+    // present) in the background — never blocks the server from serving requests.
+    console.log('[reference] warming human references on startup...');
+    Promise.allSettled([
+        loadSpeciesAnnotations('human'),
+        loadSpeciesCdna('human'),
+    ]).then((results) => {
+        const failed = results.filter((r) => r.status === 'rejected');
+        if (failed.length) {
+            console.warn('[reference] human warm: some parts failed',
+                failed.map((f: any) => f.reason?.message || f.reason));
+        } else {
+            console.log('[reference] human references ready');
+        }
+    });
+
+    // Additional species from PRELOAD_REFERENCES (non-blocking). The in-flight
+    // guards dedupe human if it is also listed there.
+    preloadReferences().catch((e) =>
+        console.error("[reference] preload error:", e?.message || e)
+    );
 });
 
 
