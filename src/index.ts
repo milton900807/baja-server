@@ -796,7 +796,7 @@ async function ensureFastaFile(
 // Legacy / UI-default genome names -> on-disk index directory names.
 // Keep in sync with _ALIASES in search.py.
 const OFFTARGET_ALIASES: Record<string, string> = {
-    "Homo_sapiens.GRCh38.88.3utr": "human_cdna",
+    "Homo_sapiens.GRCh38.88.3utr": "human_all_transcripts",
     "3UTR_human": "human_3utr",
     "3UTR_mouse": "mouse_3utr",
 };
