@@ -67,7 +67,9 @@ export const environment = {
   wd: trailscriptPath,
   devPath: trailscriptPath,
   htsFilesPath: trailscriptPath + '/data/hts',
-  bigDataFilesPath: '/bd',
+  // Root directory holding big-data files (bigWig/VCF/etc.). Override with the
+  // BIG_DATA environment variable; defaults to ~/baja-bd for this deployment.
+  bigDataFilesPath: process.env.BIG_DATA || path.join(homeDir, 'baja-bd'),
   configPath: trailscriptPath + '/config',
   userData: ljUsersDir,
   ott_root: '/mnt/ott/genomes',

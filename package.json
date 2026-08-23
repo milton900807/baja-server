@@ -4,7 +4,7 @@
   "description": "",
   "main": "dist/index.js",
   "scripts": {
-    "clean": "rimraf dist/*",
+    "clean": "node tools/clean.js",
     "copy-assets": "node tools/copyAssets",
     "lint": "tslint -c tslint.json -p tsconfig.json --fix",
     "tsc": "tsc",

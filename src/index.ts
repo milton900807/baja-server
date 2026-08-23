@@ -18,6 +18,7 @@ import { DataIndex } from "./d-index";
 import { TemplateServer } from "./usertemplates/template-server";
 import { PyCompute } from "./pycompute/py-comp";
 import { spawn, exec } from "child_process";
+import Stripe from "stripe";
 import { EnvConfig, environment } from "./environment";
 import xlsx from 'node-xlsx';
 import fetch from 'node-fetch';
@@ -2075,6 +2076,265 @@ app.get("/bigdata-exists", async (req, res) => {
         const msg = err instanceof Error ? err.message : "Unknown error";
         console.log("bigdata-exists failed:", err);
         return res.status(500).json({ msg });
+    }
+});
+
+
+// ---------------------------------------------------------------------------------------
+// OAuth2 / OIDC token-exchange proxy.
+//
+// The browser login (src/app/auth) runs Authorization Code + PKCE. Providers whose token
+// endpoint needs a client secret and/or blocks browser CORS (Google web clients, Facebook,
+// GitHub, Apple) POST their authorization code here; this endpoint adds the secret and
+// exchanges it server-side, then returns the token JSON. Secrets come from server env vars
+// and never touch the browser.
+//
+// Env vars (set the ones you use):
+//   GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET
+//   FACEBOOK_APP_ID (or FACEBOOK_CLIENT_ID) / FACEBOOK_APP_SECRET (or FACEBOOK_CLIENT_SECRET)
+//   GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET
+//   APPLE_CLIENT_ID  / APPLE_CLIENT_SECRET  (Apple's secret is a signed JWT)
+const OIDC_TOKEN_PROVIDERS: { [k: string]: any } = {
+    google: {
+        tokenUrl: 'https://oauth2.googleapis.com/token',
+        clientId: () => process.env.GOOGLE_CLIENT_ID,
+        clientSecret: () => process.env.GOOGLE_CLIENT_SECRET,
+        acceptJson: false,
+    },
+    facebook: {
+        tokenUrl: 'https://graph.facebook.com/v18.0/oauth/access_token',
+        clientId: () => process.env.FACEBOOK_APP_ID || process.env.FACEBOOK_CLIENT_ID,
+        clientSecret: () => process.env.FACEBOOK_APP_SECRET || process.env.FACEBOOK_CLIENT_SECRET,
+        acceptJson: false,
+    },
+    github: {
+        tokenUrl: 'https://github.com/login/oauth/access_token',
+        clientId: () => process.env.GITHUB_CLIENT_ID,
+        clientSecret: () => process.env.GITHUB_CLIENT_SECRET,
+        acceptJson: true,   // GitHub returns urlencoded unless you ask for JSON
+    },
+    apple: {
+        tokenUrl: 'https://appleid.apple.com/auth/token',
+        clientId: () => process.env.APPLE_CLIENT_ID,
+        clientSecret: () => process.env.APPLE_CLIENT_SECRET,
+        acceptJson: false,
+    },
+};
+
+app.post(['/oidc/token', '/api/oidc/token'], async (req: any, res: any) => {
+    try {
+        const { provider, code, code_verifier, redirect_uri } = req.body || {};
+        const p = OIDC_TOKEN_PROVIDERS[String(provider || '').toLowerCase()];
+        if (!p) return res.status(400).json({ error: 'unsupported_provider', provider });
+
+        const clientId = p.clientId() || req.body.client_id;
+        const clientSecret = p.clientSecret();
+        if (!clientId || !clientSecret) {
+            return res.status(500).json({
+                error: 'server_not_configured',
+                error_description: `Set the ${String(provider).toUpperCase()} client id/secret env vars on the server.`,
+            });
+        }
+        if (!code || !redirect_uri) {
+            return res.status(400).json({ error: 'missing_params', error_description: 'code and redirect_uri are required.' });
+        }
+
+        const body = new URLSearchParams({
+            grant_type: 'authorization_code',
+            code: String(code),
+            client_id: String(clientId),
+            client_secret: String(clientSecret),
+            redirect_uri: String(redirect_uri),
+        });
+        if (code_verifier) body.set('code_verifier', String(code_verifier));
+
+        const headers: any = { 'Content-Type': 'application/x-www-form-urlencoded' };
+        if (p.acceptJson) headers.Accept = 'application/json';
+
+        const r = await fetch(p.tokenUrl, { method: 'POST', headers, body: body.toString() });
+        const text = await r.text();
+        let json: any;
+        try {
+            json = JSON.parse(text);
+        } catch {
+            // Some providers (older Facebook/GitHub) return application/x-www-form-urlencoded.
+            const params = new URLSearchParams(text);
+            json = {};
+            params.forEach((v: string, k: string) => { json[k] = v; });
+        }
+        if (!r.ok || json.error) return res.status(r.ok ? 400 : r.status).json(json);
+        return res.json(json);
+    } catch (e: any) {
+        return res.status(500).json({ error: 'proxy_error', error_description: e?.message || String(e) });
+    }
+});
+
+
+// ---------------------------------------------------------------------------------------
+// Stripe subscriptions.
+//
+// Hosted Stripe Checkout is used so cards, Apple Pay, Google Pay and Link are all supported
+// with no PCI burden. The frontend (SubscriptionService) calls these; access is gated by a
+// live subscription-status check against Stripe (keyed on the signed-in user's email).
+//
+// Env vars: STRIPE_SECRET_KEY, STRIPE_PRICE_ID (the subscription price), and optionally
+// STRIPE_WEBHOOK_SECRET.
+// Use a standard account secret key (sk_live_.../sk_test_...). Organization keys
+// (sk_org_...) are NOT supported by this SDK version — they require a Stripe-Context
+// header the SDK can't send.
+const stripeClient: Stripe | null = process.env.STRIPE_SECRET_KEY
+    ? new Stripe(process.env.STRIPE_SECRET_KEY)
+    : null;
+
+function stripeReady(res: any): boolean {
+    if (!stripeClient) {
+        res.status(500).json({ error: 'stripe_not_configured', error_description: 'Set STRIPE_SECRET_KEY on the server.' });
+        return false;
+    }
+    return true;
+}
+
+async function stripeCustomerFor(email: string, name?: string): Promise<Stripe.Customer> {
+    const found = await stripeClient!.customers.list({ email, limit: 1 });
+    if (found.data.length) return found.data[0];
+    return stripeClient!.customers.create({ email, name });
+}
+
+// Accept either a price id (price_...) or a product id (prod_...). Passing an explicit
+// price id is always unambiguous. For a product we resolve deterministically:
+//   1. the product's configured DEFAULT price (set this in the dashboard), else
+//   2. the single active recurring price if there's exactly one, else
+//   3. the most recently created active recurring price (and warn — ambiguous).
+// Cached so we don't hit Stripe on every checkout.
+const priceCache: { [k: string]: string } = {};
+async function resolvePriceId(idOrProduct: string): Promise<string> {
+    if (!idOrProduct.startsWith('prod_')) return idOrProduct; // already a price id
+    if (priceCache[idOrProduct]) return priceCache[idOrProduct];
+
+    // 1. Honor the product's default price (deterministic — this is "the" price).
+    const product = await stripeClient!.products.retrieve(idOrProduct);
+    let priceId: string | undefined =
+        typeof product.default_price === 'string' ? product.default_price
+        : (product.default_price && typeof product.default_price === 'object') ? product.default_price.id
+        : undefined;
+
+    // 2/3. No default set → fall back to active recurring prices.
+    if (!priceId) {
+        const prices = await stripeClient!.prices.list({ product: idOrProduct, active: true, limit: 100 });
+        const recurring = prices.data.filter(p => p.recurring);
+        if (!recurring.length && !prices.data.length) {
+            throw new Error(`Product ${idOrProduct} has no active price. Add a recurring price to it in Stripe.`);
+        }
+        const pick = recurring[0] || prices.data[0]; // Stripe lists newest-first
+        if (recurring.length > 1) {
+            console.warn(`[stripe] Product ${idOrProduct} has ${recurring.length} active recurring prices and no default_price set; ` +
+                `using ${pick.id} (newest). Set a default price on the product, or put the exact price_... in STRIPE_PRICE_ID.`);
+        }
+        priceId = pick.id;
+    }
+
+    priceCache[idOrProduct] = priceId;
+    return priceId;
+}
+
+// Is there an active/trialing subscription for this email?
+app.get(['/stripe/subscription-status', '/api/stripe/subscription-status'], async (req: any, res: any) => {
+    if (!stripeReady(res)) return;
+    try {
+        const email = String(req.query.email || '').trim();
+        if (!email) return res.status(400).json({ error: 'missing_email' });
+        const customers = await stripeClient!.customers.list({ email, limit: 1 });
+        if (!customers.data.length) return res.json({ active: false, status: 'none' });
+        const subs = await stripeClient!.subscriptions.list({ customer: customers.data[0].id, status: 'all', limit: 10 });
+        const active = subs.data.find(s => s.status === 'active' || s.status === 'trialing');
+        return res.json({
+            active: !!active,
+            status: active ? active.status : (subs.data[0]?.status || 'none'),
+            currentPeriodEnd: active ? active.current_period_end : null,
+            customerId: customers.data[0].id,
+        });
+    } catch (e: any) {
+        return res.status(500).json({ error: 'stripe_error', error_description: e?.message || String(e) });
+    }
+});
+
+// The configured plan price, for display on the paywall (so the UI matches what Stripe
+// actually charges instead of hardcoded copy). { display: '$1', period: '/year', ... }.
+app.get(['/stripe/price-info', '/api/stripe/price-info'], async (req: any, res: any) => {
+    if (!stripeReady(res)) return;
+    try {
+        const idOrProduct = String(req.query.priceId || process.env.STRIPE_PRICE_ID || '');
+        if (!idOrProduct) return res.status(500).json({ error: 'no_price', error_description: 'Set STRIPE_PRICE_ID on the server.' });
+        const priceId = await resolvePriceId(idOrProduct);
+        const price = await stripeClient!.prices.retrieve(priceId);
+
+        const currency = (price.currency || 'usd').toUpperCase();
+        const symbol = currency === 'USD' ? '$' : '';
+        const amount = (price.unit_amount ?? 0) / 100;
+        const amountStr = Number.isInteger(amount) ? String(amount) : amount.toFixed(2);
+        const display = symbol ? symbol + amountStr : amountStr + ' ' + currency;
+
+        let period = '';
+        if (price.recurring) {
+            const n = price.recurring.interval_count || 1;
+            period = '/' + (n > 1 ? n + ' ' : '') + price.recurring.interval + (n > 1 ? 's' : '');
+        }
+        return res.json({
+            priceId, display, period,
+            amount, currency,
+            interval: price.recurring?.interval || null,
+            intervalCount: price.recurring?.interval_count || null,
+        });
+    } catch (e: any) {
+        return res.status(500).json({ error: 'stripe_error', error_description: e?.message || String(e) });
+    }
+});
+
+// Start a hosted Checkout for a subscription; returns { url } to redirect to.
+app.post(['/stripe/create-checkout-session', '/api/stripe/create-checkout-session'], async (req: any, res: any) => {
+    if (!stripeReady(res)) return;
+    try {
+        const { email, name, priceId, appBase, returnPath } = req.body || {};
+        if (!email) return res.status(400).json({ error: 'missing_email' });
+        const priceOrProduct = priceId || process.env.STRIPE_PRICE_ID;
+        if (!priceOrProduct) return res.status(500).json({ error: 'no_price', error_description: 'Set STRIPE_PRICE_ID on the server (or pass priceId).' });
+        const price = await resolvePriceId(String(priceOrProduct));
+
+        const base = String(appBase || req.headers.origin || '').replace(/\/$/, '');
+        const back = returnPath || '/subscribe';
+        const customer = await stripeCustomerFor(email, name);
+
+        const session = await stripeClient!.checkout.sessions.create({
+            mode: 'subscription',
+            customer: customer.id,
+            line_items: [{ price, quantity: 1 }],
+            allow_promotion_codes: true,
+            client_reference_id: email,
+            success_url: `${base}${back}?status=success&session_id={CHECKOUT_SESSION_ID}`,
+            cancel_url: `${base}${back}?status=cancel`,
+        });
+        return res.json({ url: session.url, id: session.id });
+    } catch (e: any) {
+        return res.status(500).json({ error: 'stripe_error', error_description: e?.message || String(e) });
+    }
+});
+
+// Open the Stripe billing portal (manage / cancel subscription); returns { url }.
+app.post(['/stripe/portal', '/api/stripe/portal'], async (req: any, res: any) => {
+    if (!stripeReady(res)) return;
+    try {
+        const { email, appBase } = req.body || {};
+        if (!email) return res.status(400).json({ error: 'missing_email' });
+        const customers = await stripeClient!.customers.list({ email, limit: 1 });
+        if (!customers.data.length) return res.status(404).json({ error: 'no_customer' });
+        const base = String(appBase || req.headers.origin || '').replace(/\/$/, '');
+        const portal = await stripeClient!.billingPortal.sessions.create({
+            customer: customers.data[0].id,
+            return_url: base + '/',
+        });
+        return res.json({ url: portal.url });
+    } catch (e: any) {
+        return res.status(500).json({ error: 'stripe_error', error_description: e?.message || String(e) });
     }
 });
 
