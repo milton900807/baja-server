@@ -30,7 +30,7 @@
             },
             {
                 "label": "Splicing Models",
-                "script": "ljl/screens/menu/splicing/test-loader.js",
+                "script": "ljl/manchester/menu/splicing/test-loader.js",
                 "data": "/splicing",
                 "server": "/ionworks"
             },
