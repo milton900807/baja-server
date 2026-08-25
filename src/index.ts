@@ -198,6 +198,341 @@ app.get(['/api/ensembl/sequence/:id', '/ensembl/sequence/:id'], async (req: any,
     }
 });
 
+// Flanking genomic sequence for a chromosome region — display-only context showing where
+// a track sits in the genome. Proxies Ensembl REST /sequence/region. Failsafe: any error
+// returns an empty body (200) so the client never breaks on a missing flank.
+app.get(['/api/ensembl/region', '/ensembl/region'], async (req: any, res: any) => {
+    try {
+        const species = String(req.query.species || 'human').trim() || 'human';
+        const region = String(req.query.region || '').trim();   // e.g. "17:7668000..7669000:1"
+        if (!region) return res.type('text/plain').send('');
+        const prefix = (req.query.prefix as string) || ENSEMBL_REST_BASE;
+        const url = `${prefix}/sequence/region/${species}/${region}?content-type=text/plain`;
+        const r = await fetch(url, { headers: { Accept: 'text/plain' } });
+        if (!r.ok) return res.type('text/plain').send('');
+        const seq = (await r.text()).trim();
+        return res.type('text/plain').send(seq);
+    } catch (error: any) {
+        return res.type('text/plain').send('');
+    }
+});
+
+// Region variants from the major variant databases (ClinVar / dbSNP / gnomAD /
+// COSMIC) for a genomic region. Proxies Ensembl overlap (variation / somatic_
+// variation) and the gnomAD GraphQL API so the browser never calls them directly.
+//   /variants/region?species=human&region=17:7676100-7676300&db=clinvar&limit=500
+// Databases whose full data can be downloaded into the local reference store as a
+// bgzipped + tabix-indexed VCF and queried by region locally (no live API call).
+// NCBI ships ClinVar already bgzipped with a .tbi. dbSNP (~25 GB), gnomAD (per-chrom,
+// huge) and COSMIC (license-gated) are NOT bulk-downloadable and stay on the live API.
+const VARIANT_DB_SOURCES: Record<string, { vcf: string; tbi: string; local: string }> = {
+    clinvar: {
+        vcf: 'https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38/clinvar.vcf.gz',
+        tbi: 'https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38/clinvar.vcf.gz.tbi',
+        local: 'reference_data/variants/clinvar.vcf.gz',
+    },
+};
+
+function variantDbLocalPath(db: string): string | null {
+    const s = VARIANT_DB_SOURCES[db];
+    return s ? path.resolve(s.local) : null;
+}
+
+function variantDbReady(db: string): boolean {
+    const lp = variantDbLocalPath(db);
+    return !!lp && fs.existsSync(lp) && fs.existsSync(lp + '.tbi');
+}
+
+// Is the `tabix` binary available? Cached after the first probe. When it isn't,
+// local VCF queries can't run, so we fall back to the live API instead of silently
+// returning nothing.
+let _tabixOk: boolean | null = null;
+function hasTabix(): Promise<boolean> {
+    if (_tabixOk != null) return Promise.resolve(_tabixOk);
+    return new Promise((resolve) => {
+        try {
+            const p = spawn('tabix', ['--version']);
+            p.on('error', () => { _tabixOk = false; resolve(false); });
+            p.on('close', (code) => { _tabixOk = (code === 0); resolve(_tabixOk); });
+        } catch { _tabixOk = false; resolve(false); }
+    });
+}
+
+const _variantDlInFlight: Record<string, boolean> = {};
+
+// Download a database's VCF (+ .tbi index) into the reference location, once.
+async function ensureVariantDb(db: string): Promise<boolean> {
+    const s = VARIANT_DB_SOURCES[db];
+    if (!s) return false;
+    const lp = path.resolve(s.local);
+    if (fs.existsSync(lp) && fs.existsSync(lp + '.tbi')) return true;
+    if (_variantDlInFlight[db]) return false;
+    _variantDlInFlight[db] = true;
+    try {
+        fs.mkdirSync(path.dirname(lp), { recursive: true });
+        console.log(`[variants] ${db}: downloading ${s.vcf} -> ${lp}`);
+        await downloadToFileProgress(s.vcf, lp, {
+            onProgress: (w, t) => { if (t && Math.floor(w / t * 10) !== Math.floor((w - 1) / t * 10)) console.log(`[variants] ${db}: ${Math.floor(w / t * 100)}%`); },
+        });
+        await downloadToFileProgress(s.tbi, lp + '.tbi', {});
+        const ok = fs.existsSync(lp) && fs.existsSync(lp + '.tbi');
+        console.log(`[variants] ${db}: download ${ok ? 'complete' : 'FAILED'}`);
+        return ok;
+    } catch (e: any) {
+        console.error(`[variants] ${db}: download failed:`, e?.message || e);
+        return false;
+    } finally {
+        _variantDlInFlight[db] = false;
+    }
+}
+
+function parseVcfInfo(info: string): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const kv of String(info || '').split(';')) {
+        const i = kv.indexOf('=');
+        if (i > 0) out[kv.slice(0, i)] = kv.slice(i + 1);
+        else if (kv) out[kv] = '';
+    }
+    return out;
+}
+
+// Skip structural variants: alleles longer than this (bp) aren't point variants and
+// would render as giant deletions/insertions.
+const MAX_VARIANT_ALLELE = 50;
+
+// Parse tabix/pysam VCF output lines into normalized variants.
+function parseVcfLines(buf: string, db: string, limit: number): any[] {
+    const out: any[] = [];
+    for (const line of buf.split('\n')) {
+        if (!line || line[0] === '#') continue;
+        const f = line.split('\t');
+        if (f.length < 8) continue;
+        const pos = parseInt(f[1], 10);
+        const ref = f[3];
+        if (ref.length > MAX_VARIANT_ALLELE) continue;   // skip structural variants
+        const info = parseVcfInfo(f[7]);
+        let clinsig: string[] = [];
+        if (info.CLNSIG) clinsig = info.CLNSIG.replace(/_/g, ' ').split(/[|,/]/).map((s) => s.trim()).filter(Boolean);
+        const gene = (info.GENEINFO || '').split(':')[0] || null;
+        const rid = info.RS ? 'rs' + info.RS : (f[2] && f[2] !== '.' ? f[2] : (db || 'variant'));
+        for (const alt of String(f[4] || '').split(',')) {
+            if (alt.length > MAX_VARIANT_ALLELE) continue;   // structural alt allele
+            out.push({
+                id: rid, chr: String(f[0]).replace(/^chr/, ''), start: pos, end: pos + Math.max(0, ref.length - 1),
+                strand: 1, ref, alt, alleles: [ref, alt], clinsig,
+                consequence: info.MC ? String(info.MC).split('|').pop() : null,
+                source: db === 'clinvar' ? 'ClinVar' : db, af: null, gene,
+            });
+            if (out.length >= limit) return out;
+        }
+    }
+    return out;
+}
+
+// Is Python's pysam importable? (Used to query indexed VCFs when the `tabix` CLI is
+// absent — e.g. local dev.) Cached after first probe.
+let _pysamOk: boolean | null = null;
+function hasPysam(): Promise<boolean> {
+    if (_pysamOk != null) return Promise.resolve(_pysamOk);
+    return new Promise((resolve) => {
+        try {
+            const p = spawn('python3', ['-c', 'import pysam']);
+            p.on('error', () => { _pysamOk = false; resolve(false); });
+            p.on('close', (code) => { _pysamOk = (code === 0); resolve(_pysamOk); });
+        } catch { _pysamOk = false; resolve(false); }
+    });
+}
+
+const PYSAM_FETCH = 'import sys,pysam\n' +
+    'vcf=sys.argv[1]; region=sys.argv[2]\n' +
+    'chrom,rest=region.split(":",1); s,e=rest.split("-",1)\n' +
+    'tb=pysam.TabixFile(vcf)\n' +
+    'for row in tb.fetch(chrom, max(0,int(s)-1), int(e)):\n' +
+    '    sys.stdout.write(row+"\\n")\n';
+
+// Query a locally-downloaded, tabix-indexed VCF by region — via the `tabix` binary
+// when present, otherwise via pysam (same bgzip/tbi files).
+function queryLocalVcf(file: string, chr: string, start: number, end: number, db: string, limit: number): Promise<any[]> {
+    return new Promise(async (resolve) => {
+        const region = `${chr}:${start}-${end}`;
+        const useTabix = await hasTabix();
+        const p = useTabix
+            ? spawn('tabix', [file, region])
+            : spawn('python3', ['-c', PYSAM_FETCH, file, region]);
+        let buf = '';
+        p.stdout.on('data', (d) => { buf += d.toString(); });
+        p.on('error', () => resolve([]));
+        p.on('close', () => resolve(parseVcfLines(buf, db, limit)));
+    });
+}
+
+async function fetchGnomadRegion(chr: string, start: number, end: number, limit: number): Promise<any[]> {
+    try {
+        const query = `query($chrom:String!,$start:Int!,$stop:Int!){region(chrom:$chrom,start:$start,stop:$stop,reference_genome:GRCh38){variants(dataset:gnomad_r4){variant_id pos ref alt genome{af}exome{af}}}}`;
+        const r = await fetch('https://gnomad.broadinstitute.org/api', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: JSON.stringify({ query, variables: { chrom: String(chr).replace(/^chr/, ''), start, stop: end } }),
+        });
+        if (!r.ok) return [];
+        const j: any = await r.json();
+        const vs: any[] = j?.data?.region?.variants || [];
+        return vs.slice(0, limit).map((v: any) => {
+            const af = (v.genome && v.genome.af != null) ? v.genome.af : (v.exome && v.exome.af != null ? v.exome.af : null);
+            return {
+                id: v.variant_id, chr: String(chr).replace(/^chr/, ''), start: v.pos, end: v.pos,
+                strand: 1, ref: v.ref, alt: v.alt, alleles: [v.ref, v.alt],
+                clinsig: [], consequence: null, source: 'gnomAD', af,
+            };
+        });
+    } catch { return []; }
+}
+
+// One Ensembl overlap call (variation / somatic_variation) -> normalized variants.
+async function fetchEnsemblOverlapVariants(species: string, chr: string, start: number, end: number, feature: string): Promise<any[]> {
+    const url = `${ENSEMBL_REST_BASE}/overlap/region/${species}/${chr}:${start}-${end}?feature=${feature}`;
+    const r = await fetch(url, { headers: { Accept: 'application/json' } });
+    if (!r.ok) throw new Error(`ensembl ${r.status}`);
+    const arr: any[] = await r.json();
+    const out: any[] = [];
+    for (const v of arr) {
+        const alleles = Array.isArray(v.alleles) ? v.alleles : [];
+        const clin = Array.isArray(v.clinical_significance) ? v.clinical_significance : [];
+        out.push({
+            id: v.id, chr: String(v.seq_region_name || chr).replace(/^chr/, ''),
+            start: v.start, end: v.end, strand: v.strand,
+            ref: alleles[0] || '', alt: alleles[1] || '', alleles,
+            clinsig: clin, consequence: v.consequence_type,
+            source: v.source || (feature === 'somatic_variation' ? 'COSMIC' : 'dbSNP'), af: null,
+        });
+    }
+    return out;
+}
+
+// Region-scoped dbSNP cache: dbSNP is far too large to download whole, so we cache
+// just the queried genomic windows into the reference store as fixed 10 kb tiles
+// (reference_data/variants/dbsnp_cache/<chr>_<bin>.json). Overlapping queries reuse
+// the tiles; only never-seen windows hit Ensembl.
+const DBSNP_BIN = 10000;      // 10 kb tiles
+const DBSNP_MAX_BINS = 16;    // cap coverage per request (160 kb) to bound work
+const _dbsnpBinInFlight: Record<string, Promise<any[]>> = {};
+
+function dbsnpCacheDir(): string { return path.resolve('reference_data/variants/dbsnp_cache'); }
+
+async function dbsnpTile(species: string, chr: string, bin: number): Promise<any[]> {
+    const file = path.join(dbsnpCacheDir(), `${chr}_${bin}.json`);
+    try { if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { /* refetch */ }
+    const key = `${species}:${chr}:${bin}`;
+    if (_dbsnpBinInFlight[key]) return _dbsnpBinInFlight[key];
+    const p = (async () => {
+        const s = bin * DBSNP_BIN + 1, e = (bin + 1) * DBSNP_BIN;
+        let vs: any[] = [];
+        try { vs = await fetchEnsemblOverlapVariants(species, chr, s, e, 'variation'); } catch { vs = []; }
+        try { fs.mkdirSync(dbsnpCacheDir(), { recursive: true }); fs.writeFileSync(file, JSON.stringify(vs)); } catch { }
+        return vs;
+    })();
+    _dbsnpBinInFlight[key] = p;
+    try { return await p; } finally { delete _dbsnpBinInFlight[key]; }
+}
+
+async function ensureDbsnpRegionCache(species: string, chr: string, start: number, end: number, limit: number): Promise<{ variants: any[]; source: string; binsCapped: boolean }> {
+    const firstBin = Math.floor(start / DBSNP_BIN), lastBin = Math.floor(end / DBSNP_BIN);
+    const bins: number[] = [];
+    for (let b = firstBin; b <= lastBin && bins.length < DBSNP_MAX_BINS; b++) bins.push(b);
+    const binsCapped = (lastBin - firstBin + 1) > bins.length;
+    let anyCached = false, anyFetched = false;
+    const seen = new Set<string>();
+    const out: any[] = [];
+    for (const b of bins) {
+        const wasCached = fs.existsSync(path.join(dbsnpCacheDir(), `${chr}_${b}.json`));
+        const vs = await dbsnpTile(species, chr, b);
+        if (wasCached) anyCached = true; else anyFetched = true;
+        for (const v of vs) {
+            if (v.start < start || v.start > end) continue;
+            const k = (v.id || '') + ':' + v.start + ':' + (v.alt || '');
+            if (seen.has(k)) continue;
+            seen.add(k);
+            out.push(v);
+            if (out.length >= limit) break;
+        }
+        if (out.length >= limit) break;
+    }
+    const source = (anyCached && anyFetched) ? 'local-cache+live' : (anyCached ? 'local-cache' : 'live-cached');
+    return { variants: out, source, binsCapped };
+}
+
+app.get(['/api/variants/region', '/variants/region'], async (req: any, res: any) => {
+    const db = String(req.query.db || 'clinvar').trim().toLowerCase();
+    try {
+        const species = String(req.query.species || 'human').trim() || 'human';
+        const region = String(req.query.region || '').trim();   // "17:7676100-7676300"
+        const limit = Math.max(1, Math.min(2000, parseInt(String(req.query.limit || '500'), 10) || 500));
+        if (!region) return res.json({ db, variants: [], error: 'no region' });
+        const m = region.match(/^(\w+):(\d+)-(\d+)$/);
+        if (!m) return res.json({ db, variants: [], error: 'bad region' });
+        const chr = m[1].replace(/^chr/, ''), start = parseInt(m[2], 10), end = parseInt(m[3], 10);
+
+        // Prefer a locally-downloaded copy in the reference store (fast, no live call) —
+        // when a local query engine (tabix CLI or pysam) is available; otherwise fall
+        // through to the live API rather than silently returning nothing.
+        if (variantDbReady(db) && (await hasTabix() || await hasPysam())) {
+            const variants = await queryLocalVcf(variantDbLocalPath(db)!, chr, start, end, db, limit);
+            const total = variants.length;
+            return res.json({ db, region, source: 'local', total, count: variants.length, truncated: false, variants });
+        }
+        // Downloadable DB not present yet -> fetch it into the reference store for next time,
+        // and serve this request from the live API meanwhile.
+        if (VARIANT_DB_SOURCES[db]) { ensureVariantDb(db).catch(() => { }); }
+
+        // dbSNP is too large to download whole -> serve from a region-scoped tile cache
+        // in the reference store (only queried windows are fetched + persisted).
+        if (db === 'dbsnp') {
+            const cached = await ensureDbsnpRegionCache(species, chr, start, end, limit);
+            return res.json({
+                db, region, source: cached.source, count: cached.variants.length,
+                truncated: cached.variants.length >= limit, binsCapped: cached.binsCapped,
+                variants: cached.variants,
+            });
+        }
+
+        let variants: any[] = [];
+        if (db === 'gnomad') {
+            variants = await fetchGnomadRegion(chr, start, end, limit);
+        } else {
+            const feature = (db === 'cosmic') ? 'somatic_variation' : 'variation';
+            try {
+                variants = await fetchEnsemblOverlapVariants(species, chr, start, end, feature);
+            } catch (e: any) {
+                return res.json({ db, variants: [], error: e?.message || String(e) });
+            }
+            // ClinVar = the clinically-annotated subset of the variation set.
+            if (db === 'clinvar') variants = variants.filter((x) => (x.clinsig || []).length > 0);
+        }
+        const total = variants.length;
+        const truncated = total > limit;
+        if (truncated) variants = variants.slice(0, limit);
+        return res.json({ db, region, source: 'live', total, count: variants.length, truncated, variants });
+    } catch (error: any) {
+        return res.json({ db, variants: [], error: error?.message || String(error) });
+    }
+});
+
+// Download a variant database into the reference store (only the bulk-downloadable
+// ones — currently ClinVar). dbSNP/gnomAD/COSMIC are not bulk-downloadable and are
+// served from the live API instead.
+app.get(['/api/variants/install/:db', '/variants/install/:db'], async (req: any, res: any) => {
+    const db = String(req.params.db || '').trim().toLowerCase();
+    if (!VARIANT_DB_SOURCES[db]) {
+        return res.json({ db, ok: false, error: 'no bulk-downloadable source (dbsnp/gnomad/cosmic use the live API); downloadable: ' + Object.keys(VARIANT_DB_SOURCES).join(', ') });
+    }
+    try {
+        const ok = await ensureVariantDb(db);
+        return res.json({ db, ok, ready: variantDbReady(db), path: variantDbLocalPath(db) });
+    } catch (e: any) {
+        return res.json({ db, ok: false, error: e?.message || String(e) });
+    }
+});
+
 // Proactively install (download + index) local reference data for a species, or
 // "all" for human/mouse/rat. Lets an operator warm the references so the first
 // transcript request doesn't pay the (potentially large) download cost.
@@ -6944,9 +7279,11 @@ function buildPythonEnv(req: any) {
     // ----------------------------
     // User identity propagation
     // ----------------------------
+    // Guard: startup self-checks call this with a synthetic req that has no headers.
+    const headers = req.headers || {};
     const userId =
-        req.headers["x-user-id"] ||
-        req.headers.user ||
+        headers["x-user-id"] ||
+        headers.user ||
         "";
 
     if (typeof userId === "string" && userId.length > 0) {
