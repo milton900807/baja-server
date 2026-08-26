@@ -10751,7 +10751,15 @@ setInterval(() => {
 
 async function startServer() {
     try {
-        await initializeAnnotationCache();
+        // Warm only human + mouse annotations at startup to cut peak heap during
+        // reference loading — the box (7.7 GB RAM, 6 GB V8 heap) was OOM-crash-looping
+        // while warming all species, which left referencesLoading=true forever and
+        // forced the Ensembl API annotation fallback. dog/rat/yeast stay in
+        // speciesRegistry so an explicit request for them can still lazy-load on demand.
+        const STARTUP_ANNOTATION_SKIP = ["dog", "rat", "yeast"];
+        await initializeAnnotationCache(
+            Object.keys(speciesRegistry).filter((s) => !STARTUP_ANNOTATION_SKIP.includes(s))
+        );
     } catch (err) {
         console.error("[startup] Failed to initialize annotations:", err);
         process.exit(1);
