@@ -141,7 +141,7 @@ app.get(['/transcript/:transcriptId', '/api/ensembl/transcript/:transcriptId'], 
         // transcript id prefix (ENST=human, ENSMUST=mouse, ENSRNOT=rat).
         const requestedSpecies = String(req.query.species || '').trim();
         const species = normalizeSpecies(
-            requestedSpecies || speciesFromTranscriptId(transcriptId) || 'human'
+            requestedSpecies || speciesFromTranscriptId(transcriptId) || speciesByRegionIndex(transcriptId) || 'human'
         );
         const useReverseComplement = req.query.reverseComplement === 'true';
 
@@ -1915,6 +1915,7 @@ const GENOME_FA_BY_SPECIES: Record<string, string> = {
     human: process.env.GENOME_FA_HUMAN || _genomeDir("GRCh38.primary_assembly.genome.fa"),
     mouse: process.env.GENOME_FA_MOUSE || _genomeDir("Mus_musculus.GRCm39.dna.primary_assembly.fa"),
     rat: process.env.GENOME_FA_RAT || _genomeDir("Rattus_norvegicus.mRatBN7.2.dna.toplevel.fa"),
+    yeast: process.env.GENOME_FA_YEAST || _genomeDir("Saccharomyces_cerevisiae.R64-1-1.dna.toplevel.fa"),
 };
 const _premrnaCache: Record<string, string> = {};
 
@@ -1958,6 +1959,17 @@ function faidxFetch(faPath: string, chr: string, start1: number, end1: number): 
         return buf.toString("ascii").replace(/[^A-Za-z]/g, "").toUpperCase();
     } catch { return null; }
     finally { if (fd != null) try { fs.closeSync(fd); } catch { /* ignore */ } }
+}
+
+// Fallback species detection: find the species whose loaded region index actually
+// contains this transcript id. Handles ids whose prefix doesn't encode the species —
+// e.g. yeast systematic names like "YAL069W_mRNA" — so they still resolve to pre-mRNA.
+function speciesByRegionIndex(transcriptId: string): string | null {
+    const id = stripDecimal(transcriptId);
+    for (const sp of Object.keys(annotationRegionIndex)) {
+        if (annotationRegionIndex[sp] && annotationRegionIndex[sp].has(id)) return sp;
+    }
+    return null;
 }
 
 function getPremrnaSequence(species: string, transcriptId: string): string | null {
