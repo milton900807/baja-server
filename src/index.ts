@@ -1870,9 +1870,11 @@ async function getLocalTranscriptSequence(
 // exon/CDS annotations line up by genomic offset. Genome FASTA (faidx-indexed) per
 // species; only human is bundled today (others fall back to the spliced cDNA).
 // Overridable via GENOME_FA_HUMAN.
+const _genomeDir = (f: string) => path.resolve(String(environment.wd || "../baja-apps"), "data/genome/" + f);
 const GENOME_FA_BY_SPECIES: Record<string, string> = {
-    human: process.env.GENOME_FA_HUMAN ||
-        path.resolve(String(environment.wd || "../baja-apps"), "data/genome/GRCh38.primary_assembly.genome.fa"),
+    human: process.env.GENOME_FA_HUMAN || _genomeDir("GRCh38.primary_assembly.genome.fa"),
+    mouse: process.env.GENOME_FA_MOUSE || _genomeDir("Mus_musculus.GRCm39.dna.primary_assembly.fa"),
+    rat: process.env.GENOME_FA_RAT || _genomeDir("Rattus_norvegicus.mRatBN7.2.dna.toplevel.fa"),
 };
 const _premrnaCache: Record<string, string> = {};
 
