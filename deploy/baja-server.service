@@ -1,0 +1,56 @@
+# =============================================================================
+#  baja-server.service  —  systemd unit for the BajaBio API (oligodesigner.com)
+#
+#  Install:
+#    sudo cp baja-server.service /etc/systemd/system/baja-server.service
+#    sudo systemctl daemon-reload
+#    sudo systemctl enable --now baja-server
+#    sudo systemctl status baja-server      # verify
+#    journalctl -u baja-server -f            # tail logs
+#
+#  Assumes: code at /opt/baja-server, built to dist/index.js, secrets in
+#  /opt/baja-server/.env (NOT world-readable), Python venv at /opt/venv.
+# =============================================================================
+[Unit]
+Description=BajaBio API (oligodesigner.com)
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/baja-server
+
+# All secrets (Stripe live key/price, OAuth secrets, LJL_SCR, PYTHONPATH) live here.
+EnvironmentFile=/opt/baja-server/.env
+Environment=NODE_ENV=production
+# Put the torch venv first so spawned python3 / re-exec resolves it.
+Environment=PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin
+# Node heap — size to the instance (leave ~2GB headroom): 8GB box → 6144,
+# 16GB → 12288, 32GB+ → 24576.
+Environment=NODE_OPTIONS=--max-old-space-size=6144
+# No GPU: hide CUDA devices so torch/cuda (if ever installed) fall back to CPU.
+Environment=CUDA_VISIBLE_DEVICES=
+
+ExecStart=/usr/bin/node /opt/baja-server/dist/index.js
+
+# resilience
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=60
+StartLimitBurst=5
+LimitNOFILE=65536
+
+# logging → journald (journalctl -u baja-server)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=baja-server
+
+# light hardening (loosen if a feature needs broader fs access)
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
