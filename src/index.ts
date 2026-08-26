@@ -1185,6 +1185,46 @@ function ensureOffTargetIndex(fastaPath: string, name: string): void {
     }
 }
 
+// ---- Python exec concurrency cap ------------------------------------------
+// Bound how many user-triggered python subprocesses run at once so a burst of
+// users can't spawn dozens of heavy jobs (Claude scripts, CDD, off-target,
+// splicing) and thrash / OOM the box. Excess spawns queue and start as slots
+// free up. Tune with PY_MAX_CONCURRENCY (default 6) and PY_MAX_RUNTIME_SEC
+// (default 900s — a hung job is killed so it can't hold a slot forever).
+const PY_MAX_CONCURRENCY = Math.max(1, parseInt(process.env.PY_MAX_CONCURRENCY || "6", 10));
+const PY_MAX_RUNTIME_MS = Math.max(30_000, parseInt(process.env.PY_MAX_RUNTIME_SEC || "900", 10) * 1000);
+let __pyActive = 0;
+const __pyQueue: (() => void)[] = [];
+function pyAcquire(): Promise<void> {
+    if (__pyActive < PY_MAX_CONCURRENCY) { __pyActive++; return Promise.resolve(); }
+    return new Promise<void>((resolve) => { __pyQueue.push(resolve); });
+}
+function pyRelease(): void {
+    const next = __pyQueue.shift();
+    if (next) next();                       // hand the slot to the next waiter (active count unchanged)
+    else __pyActive = Math.max(0, __pyActive - 1);
+}
+// Acquire a slot, spawn python, and guarantee the slot is released on close/error
+// or after a hard runtime cap (kills a hung job so it can't hold a slot forever).
+async function spawnPythonGated(args: string[], opts: any): Promise<any> {
+    await pyAcquire();
+    let released = false;
+    const release = () => { if (!released) { released = true; pyRelease(); } };
+    let proc: any;
+    try {
+        proc = spawn("python3", args, opts);
+    } catch (e) {
+        release();
+        throw e;
+    }
+    const killT = setTimeout(() => {
+        try { console.warn("[py-cap] killing python after runtime cap (" + (PY_MAX_RUNTIME_MS / 1000) + "s)"); proc.kill("SIGKILL"); } catch { }
+    }, PY_MAX_RUNTIME_MS);
+    proc.on("close", () => { clearTimeout(killT); release(); });
+    proc.on("error", () => { clearTimeout(killT); release(); });
+    return proc;
+}
+
 // Run the local off-target search (spawn search.py, parse its single
 // IONWORKS:RESOLUTION line synchronously) and resolve the oligoQuery result.
 async function runSearchLocal(
@@ -1196,18 +1236,18 @@ async function runSearchLocal(
         { "1": names, "2": oligos, "3": k, "4": strand, "5": runMode }));
     const script = path.join(wd, "py/sequence/offtarget/search.py");
     const env = buildPythonEnv(req);
+    const p = await spawnPythonGated(["-u", script, "jfile:" + argfile], { env });
     return await new Promise((resolve) => {
-        const p = spawn("python3", ["-u", script, "jfile:" + argfile], { env });
         let out = "";
-        p.stdout.on("data", (d) => { out += d.toString(); });
-        p.stderr.on("data", (d) => console.error("search.py: " + d));
+        p.stdout.on("data", (d: any) => { out += d.toString(); });
+        p.stderr.on("data", (d: any) => console.error("search.py: " + d));
         p.on("close", () => {
             try { fs.unlinkSync(argfile); } catch { }
-            const line = out.split("\n").find((l) => l.startsWith("IONWORKS:RESOLUTION:"));
+            const line = out.split("\n").find((l: string) => l.startsWith("IONWORKS:RESOLUTION:"));
             try { resolve(line ? JSON.parse(line.split("\t")[1]) : { oligoQuery: [] }); }
             catch { resolve({ oligoQuery: [] }); }
         });
-        p.on("error", (e) => { console.error("search.py spawn:", e); resolve({ oligoQuery: [] }); });
+        p.on("error", (e: any) => { console.error("search.py spawn:", e); resolve({ oligoQuery: [] }); });
     });
 }
 
@@ -7995,8 +8035,7 @@ const ppath = async (req: {
             SENDER_USER_ID: env.SENDER_USER_ID,
         });
 
-        const pythonProcess = spawn(
-            "python3",
+        const pythonProcess = await spawnPythonGated(
             ["-u", pythonScriptPath, ...args],
             { env }
         );
@@ -8139,8 +8178,7 @@ const post_ppath = async (req: { path: any; body: any; headers: { [x: string]: a
         BIGDATA_LOCK_TTL_SEC: env.BIGDATA_LOCK_TTL_SEC,
     });
 
-    const pythonProcess = spawn(
-        "python3",
+    const pythonProcess = await spawnPythonGated(
         ["-u", pythonScriptPath, ...args],
         { env }
     );
