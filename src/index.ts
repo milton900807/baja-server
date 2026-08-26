@@ -1748,7 +1748,14 @@ async function getTranscriptSequenceAndAnnotations(
 
     // Only cache a complete payload; if the sequence was unavailable, leave it
     // uncached so a later request can retry the Ensembl sequence fetch.
-    if (sequence && sequence.length > 0) {
+    //
+    // Also do NOT cache while the species' local reference is still loading: a
+    // payload built during that window came from the Ensembl REST fallback
+    // (annotationSource "ensembl"), and caching it would pin that transcript to
+    // the remote source forever — subsequent requests return the cached ensembl
+    // result even after local data is ready. Skipping the cache during loading
+    // means the next request (once loaded) re-resolves against local data.
+    if (sequence && sequence.length > 0 && !referencesLoading) {
         transcriptResultCache[resultKey] = payload;
     }
     return payload;
@@ -10751,12 +10758,12 @@ setInterval(() => {
 
 async function startServer() {
     try {
-        // Warm only human + mouse annotations at startup to cut peak heap during
-        // reference loading — the box (7.7 GB RAM, 6 GB V8 heap) was OOM-crash-looping
-        // while warming all species, which left referencesLoading=true forever and
-        // forced the Ensembl API annotation fallback. dog/rat/yeast stay in
+        // Warm only HUMAN annotations at startup to cut peak heap during reference
+        // loading — the box (7.7 GB RAM, 6 GB V8 heap) was OOM-crash-looping while
+        // warming all species, which left referencesLoading=true forever and forced
+        // the Ensembl API annotation fallback. mouse/rat/yeast/dog stay in
         // speciesRegistry so an explicit request for them can still lazy-load on demand.
-        const STARTUP_ANNOTATION_SKIP = ["dog", "rat", "yeast"];
+        const STARTUP_ANNOTATION_SKIP = ["mouse", "rat", "yeast", "dog"];
         await initializeAnnotationCache(
             Object.keys(speciesRegistry).filter((s) => !STARTUP_ANNOTATION_SKIP.includes(s))
         );
