@@ -129,7 +129,7 @@ interface TranscriptPayload {
     // True while this species' local reference is still downloading/indexing,
     // so the client can tell the user the data came from the remote service.
     referencesLoading?: boolean;
-    sequenceSource?: "cache" | "local" | "ensembl" | "none";
+    sequenceSource?: "cache" | "local" | "ensembl" | "none" | "premrna";
     annotationSource?: "local" | "ensembl" | "none";
 }
 
@@ -905,7 +905,7 @@ interface TranscriptPayload {
     // True while this species' local reference is still downloading/indexing,
     // so the client can tell the user the data came from the remote service.
     referencesLoading?: boolean;
-    sequenceSource?: "cache" | "local" | "ensembl" | "none";
+    sequenceSource?: "cache" | "local" | "ensembl" | "none" | "premrna";
     annotationSource?: "local" | "ensembl" | "none";
 }
 
@@ -1864,6 +1864,74 @@ async function getLocalTranscriptSequence(
     return null;
 }
 
+// --- Pre-mRNA (primary transcript) sequence: the unspliced genomic span ---------
+// A transcript id resolves to its PRE-mRNA (unspliced) sequence — the genomic slice
+// chr:txStart-txEnd on the + strand — so the genomic track renders introns and its
+// exon/CDS annotations line up by genomic offset. Genome FASTA (faidx-indexed) per
+// species; only human is bundled today (others fall back to the spliced cDNA).
+// Overridable via GENOME_FA_HUMAN.
+const GENOME_FA_BY_SPECIES: Record<string, string> = {
+    human: process.env.GENOME_FA_HUMAN ||
+        path.resolve(String(environment.wd || "../baja-apps"), "data/genome/GRCh38.primary_assembly.genome.fa"),
+};
+const _premrnaCache: Record<string, string> = {};
+
+// Pure-Node faidx: parse the .fai once (name -> {length, offset, linebases,
+// linewidth}) and seek the byte range for a 1-based inclusive region straight out
+// of the .fa — no samtools/pysam dependency (samtools isn't installed on prod).
+interface FaiEntry { length: number; offset: number; linebases: number; linewidth: number; }
+const _faiCache: Record<string, Map<string, FaiEntry> | null> = {};
+function loadFai(faPath: string): Map<string, FaiEntry> | null {
+    if (_faiCache[faPath] !== undefined) return _faiCache[faPath];
+    try {
+        const txt = fs.readFileSync(faPath + ".fai", "utf8");
+        const m = new Map<string, FaiEntry>();
+        for (const line of txt.split("\n")) {
+            if (!line) continue;
+            const f = line.split("\t");
+            if (f.length < 5) continue;
+            m.set(f[0], { length: +f[1], offset: +f[2], linebases: +f[3], linewidth: +f[4] });
+        }
+        _faiCache[faPath] = m;
+        return m;
+    } catch { _faiCache[faPath] = null; return null; }
+}
+function faidxFetch(faPath: string, chr: string, start1: number, end1: number): string | null {
+    const fai = loadFai(faPath);
+    if (!fai) return null;
+    const c = fai.get(chr);
+    if (!c) return null;
+    const s = Math.max(1, start1), e = Math.min(c.length, end1);
+    if (e < s) return null;
+    const sIdx = s - 1, eIdx = e - 1;   // 0-based base indices
+    const startByte = c.offset + Math.floor(sIdx / c.linebases) * c.linewidth + (sIdx % c.linebases);
+    const endByte = c.offset + Math.floor(eIdx / c.linebases) * c.linewidth + (eIdx % c.linebases) + 1;
+    const len = endByte - startByte;
+    if (len <= 0 || len > 64 * 1024 * 1024) return null;   // guard huge spans
+    let fd: number | null = null;
+    try {
+        fd = fs.openSync(faPath, "r");
+        const buf = Buffer.alloc(len);
+        fs.readSync(fd, buf, 0, len, startByte);
+        return buf.toString("ascii").replace(/[^A-Za-z]/g, "").toUpperCase();
+    } catch { return null; }
+    finally { if (fd != null) try { fs.closeSync(fd); } catch { /* ignore */ } }
+}
+
+function getPremrnaSequence(species: string, transcriptId: string): string | null {
+    const fa = GENOME_FA_BY_SPECIES[species];
+    if (!fa) return null;
+    const idx = annotationRegionIndex[species];
+    if (!idx) return null;   // region index not loaded yet -> fall back to cDNA
+    const region = idx.get(stripDecimal(transcriptId));
+    if (!region) return null;
+    const key = `${species}:${region.chr}:${region.start}-${region.end}`;
+    if (_premrnaCache[key]) return _premrnaCache[key];
+    const seq = faidxFetch(fa, region.chr, region.start, region.end);
+    if (seq && seq.length) { _premrnaCache[key] = seq; return seq; }
+    return null;
+}
+
 async function getTranscriptSequenceAndAnnotations(
     transcriptId: string,
     species = "human",
@@ -1904,8 +1972,14 @@ async function getTranscriptSequenceAndAnnotations(
     // so the client can still build the track; the sequence can be filled in
     // on a later attempt.
     let rawSequence = "";
-    let sequenceSource: "cache" | "local" | "ensembl" | "none" = "none";
-    if (sequenceCache[resultKey]) {
+    let sequenceSource: "cache" | "local" | "ensembl" | "none" | "premrna" = "none";
+    // Prefer the unspliced PRE-mRNA (genomic span) — a transcript id loads its
+    // primary/unspliced sequence. Falls back to the cDNA when no genome/region.
+    const premrnaSeq = await getPremrnaSequence(species, transcriptId);
+    if (premrnaSeq) {
+        rawSequence = premrnaSeq;
+        sequenceSource = "premrna";
+    } else if (sequenceCache[resultKey]) {
         rawSequence = sequenceCache[resultKey];
         sequenceSource = "cache";
     } else {
@@ -1940,7 +2014,9 @@ async function getTranscriptSequenceAndAnnotations(
     let sequence = rawSequence;
     const negativeStrand = strand === "-" || strand === "-1";
 
-    if (negativeStrand) {
+    // Pre-mRNA is the + strand genomic slice and must stay in genomic orientation
+    // (the track indexes it by genomic offset); only spliced cDNA is flipped.
+    if (negativeStrand && sequenceSource !== "premrna") {
         sequence = useReverseComplement
             ? reverseComplement(sequence)
             : reverseSequence(sequence);
