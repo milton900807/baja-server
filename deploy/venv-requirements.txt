@@ -1,0 +1,11 @@
+# Runtime Python wheels for the exec venv (/opt/venv) that the API spawns for
+# every `python3 <script>.py`. These are the REAL, pip-installable dependencies
+# the server-side scripts need — kept separate from ../baja-apps/py/requirements.txt,
+# which is an import-NAME list (many entries are stdlib or non-PyPI, e.g. os/json/PIL)
+# and therefore cannot be `pip install -r`'d wholesale.
+#
+# Minimal by design: add a wheel here only when a server-invoked script imports it.
+#   numpy    -> off-target search   (py/sequence/offtarget/search.py, build-index.py)
+#   requests -> Claude gene resolver (py/sequence/prompt-to-transcript.py, SNP info)
+numpy>=1.26
+requests>=2.25

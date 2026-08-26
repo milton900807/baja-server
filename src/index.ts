@@ -5832,15 +5832,29 @@ app.post('/share-alias', (req, res) => {
     }
 });
 
-// Resolve a short code and redirect to the view-only viewer for that screen.
+// Resolve a short code -> the view-only viewer, carrying only the CODE (never the
+// underlying path, which contains the owner's email) so nothing is exposed in the URL.
 app.get('/s/:code', (req, res) => {
     try {
         const map = loadShareAliases();
-        const target = map[String(req.params.code || '')];
-        if (!target) return res.status(404).send('This share link was not found.');
-        return res.redirect(302, '/app/manchester/viewer?path=' + encodeURIComponent(target));
+        const code = String(req.params.code || '');
+        if (!map[code]) return res.status(404).send('This share link was not found.');
+        return res.redirect(302, '/app/manchester/viewer?s=' + encodeURIComponent(code));
     } catch (e) {
         return res.status(404).send('This share link was not found.');
+    }
+});
+
+// Resolve a share code to its target path (used by the viewer; the email-bearing path
+// is returned in the response body, not placed in the browser URL).
+app.get('/share-resolve', (req, res) => {
+    try {
+        const map = loadShareAliases();
+        const target = map[String(req.query.code || '')];
+        if (!target) return res.status(404).json({ error: 'not found' });
+        return res.json({ path: target });
+    } catch (e) {
+        return res.status(404).json({ error: 'not found' });
     }
 });
 

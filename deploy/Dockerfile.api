@@ -1,0 +1,29 @@
+# API image: Node 20 + Python 3 (the server shells out to python3 / re-execs a venv).
+# Build context = baja-server repo root.  Referenced by docker-compose.yml service "api".
+FROM node:20-bookworm-slim
+
+# git: some runtime code shells out to it; python3+venv: exec/off-target scripts.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 python3-venv git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/baja-server
+
+# Install deps first for layer caching.
+COPY package*.json ./
+RUN npm ci
+
+# Build TypeScript → dist/.
+COPY . .
+RUN npm run build
+
+# Torch venv the API re-execs into. requirements.txt is optional; don't fail the
+# image build if heavy wheels are absent — install them on a GPU/host build instead.
+RUN python3 -m venv /opt/venv \
+ && ( [ -f py/requirements.txt ] && /opt/venv/bin/pip install --no-cache-dir -r py/requirements.txt || true ) \
+ && ( [ -f deploy/venv-requirements.txt ] && /opt/venv/bin/pip install --no-cache-dir -r deploy/venv-requirements.txt || true )
+ENV PATH="/opt/venv/bin:${PATH}"
+
+EXPOSE 8080
+# Heap is set via NODE_OPTIONS in compose (tunable per instance size, no rebuild).
+CMD ["node", "dist/index.js"]
