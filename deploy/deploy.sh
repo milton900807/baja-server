@@ -150,6 +150,14 @@ if want_be; then
   "${RSYNC[@]}" --delete --exclude '.git' --exclude 'node_modules' "${APPS_EXTRA_EXCL[@]}" \
     "$APPS_SRC/" "$SERVER:$REMOTE_APPS/"
 
+  # Some lionscript modules live under data/ dirs (e.g. baja/data/*.js, baja/plate/data,
+  # baja/manchester/menu/data) and get caught by the 'data' exclusion above. Ship them by
+  # syncing ONLY the .js files under baja/ from the real source (additive, un-minified,
+  # tiny). Without this, edits to those modules never reach the server.
+  c "Syncing lionscript modules under baja/**/data → $REMOTE_APPS"
+  "${RSYNC[@]}" -m --include '*/' --include '*.js' --exclude '*' \
+    "$APPS_DIR/baja/" "$SERVER:$REMOTE_APPS/baja/"
+
   if [[ "$DO_DEPS" == 1 ]]; then
     # Full install (NOT --omit=dev): the app require()s packages (e.g. chalk) that are
     # only present via the dev/transitive tree, so prod-only installs crash at boot.
