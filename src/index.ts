@@ -5790,6 +5790,60 @@ app.get('/script', async (req, res) => {
     }
 });
 
+// ---- Short share-link aliases -------------------------------------------------
+// Map a short code -> a long shared .baja path so a view-only link can be
+// oligodesigner.com/s/<code> instead of /app/manchester/viewer?path=<long hex>.
+const SHARE_ALIAS_FILE = path.join(userData, 'share-aliases.json');
+let __shareAliases: { [code: string]: string } | null = null;
+function loadShareAliases(): { [code: string]: string } {
+    if (__shareAliases) return __shareAliases;
+    try { __shareAliases = JSON.parse(fs.readFileSync(SHARE_ALIAS_FILE, 'utf-8')) || {}; }
+    catch { __shareAliases = {}; }
+    return __shareAliases;
+}
+function saveShareAliases(): void {
+    try { fs.writeFileSync(SHARE_ALIAS_FILE, JSON.stringify(__shareAliases || {})); }
+    catch (e) { console.error('share-alias save failed:', e); }
+}
+function genShareCode(len = 6): string {
+    const abc = 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no easily-confused chars
+    let c = '';
+    for (let i = 0; i < len; i++) c += abc[Math.floor(Math.random() * abc.length)];
+    return c;
+}
+
+// Create (or reuse) a short code for a shared path. Returns { code, url }.
+app.post('/share-alias', (req, res) => {
+    try {
+        const p = ('' + (req.body?.path || '')).trim();
+        if (!p) return res.status(400).json({ error: 'path required' });
+        const map = loadShareAliases();
+        // Reuse an existing code for the same target so re-sharing stays stable.
+        for (const code of Object.keys(map)) {
+            if (map[code] === p) return res.json({ code });
+        }
+        let code = genShareCode();
+        while (map[code]) code = genShareCode();
+        map[code] = p;
+        saveShareAliases();
+        return res.json({ code });
+    } catch (e) {
+        return res.status(500).json({ error: '' + e });
+    }
+});
+
+// Resolve a short code and redirect to the view-only viewer for that screen.
+app.get('/s/:code', (req, res) => {
+    try {
+        const map = loadShareAliases();
+        const target = map[String(req.params.code || '')];
+        if (!target) return res.status(404).send('This share link was not found.');
+        return res.redirect(302, '/app/manchester/viewer?path=' + encodeURIComponent(target));
+    } catch (e) {
+        return res.status(404).send('This share link was not found.');
+    }
+});
+
 app.post('/get-dev-script', async (req, res) => {
     console.log(req.body);
     let ppath = req.body.spath
