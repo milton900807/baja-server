@@ -1034,6 +1034,7 @@ function speciesFromTranscriptId(transcriptId: string): string | null {
     const id = String(transcriptId || "").toUpperCase();
     if (id.startsWith("ENSMUST")) return "mouse";
     if (id.startsWith("ENSRNOT")) return "rat";
+    if (id.startsWith("ENSCAFT")) return "dog";
     if (id.startsWith("ENST")) return "human";
     return null;
 }
@@ -1916,6 +1917,7 @@ const GENOME_FA_BY_SPECIES: Record<string, string> = {
     mouse: process.env.GENOME_FA_MOUSE || _genomeDir("Mus_musculus.GRCm39.dna.primary_assembly.fa"),
     rat: process.env.GENOME_FA_RAT || _genomeDir("Rattus_norvegicus.mRatBN7.2.dna.toplevel.fa"),
     yeast: process.env.GENOME_FA_YEAST || _genomeDir("Saccharomyces_cerevisiae.R64-1-1.dna.toplevel.fa"),
+    dog: process.env.GENOME_FA_DOG || _genomeDir("Canis_lupus_familiaris.ROS_Cfam_1.0.dna.toplevel.fa"),
 };
 const _premrnaCache: Record<string, string> = {};
 
