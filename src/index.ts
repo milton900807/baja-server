@@ -1363,6 +1363,214 @@ async function ensureSpeciesFile(species: string): Promise<string> {
     return resolvedPath;
 }
 
+// ---------------------------------------------------------------------------
+// On-demand LOCAL annotations via bgzip + tabix.
+//
+// Instead of loading every transcript's features into the JS heap (which OOM'd
+// the box on multi-species startup), we keep only a compact
+//   transcriptId -> { chr, start, end }
+// region index in memory (~40 B/transcript) and resolve a transcript's features
+// on demand with `tabix <gff3.bgz> chr:start-end`, filtered to that transcript.
+// The gff3 must be coordinate-sorted + bgzipped + tabix-indexed; we build that
+// once (idempotent) from the shipped plain-gzip gff3.
+// ---------------------------------------------------------------------------
+const annotationRegionIndex: Record<string, Map<string, { chr: string; start: number; end: number }>> = {};
+const annotationBgzPathBySpecies: Record<string, string> = {};
+const _annotationBgzipInFlight: Record<string, Promise<string | null>> = {};
+
+// Parse a single GFF3 data line into its transcript id(s) + a normalized
+// Annotation. Mirrors the per-line logic in loadGFF3 so tabix output and the
+// region-index build share one code path.
+function parseGff3Line(line: string): { ids: string[]; annotation: Annotation } | null {
+    if (!line || line.startsWith("#")) return null;
+    const fields = line.split("\t");
+    if (fields.length < 9) return null;
+    const attributes = parseAttributes(fields[8]);
+    const rawTranscriptId =
+        attributes.transcript_id ||
+        attributes.transcriptId ||
+        (fields[2] === "transcript" ? attributes.ID : undefined) ||
+        attributes.Parent;
+    if (!rawTranscriptId) return null;
+    const ids = rawTranscriptId
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .map((tid) => {
+            const bare = tid.includes(":") ? tid.slice(tid.lastIndexOf(":") + 1) : tid;
+            return stripDecimal(bare);
+        });
+    if (ids.length === 0) return null;
+    const annotation: Annotation = {
+        seqname: fields[0],
+        source: fields[1],
+        feature: fields[2],
+        start: fields[3],
+        end: fields[4],
+        score: fields[5],
+        strand: fields[6],
+        frame: fields[7],
+        attributes,
+    };
+    return { ids, annotation };
+}
+
+// gff3(.gz) path -> its bgzip twin path (…​.gff3.bgz).
+function annotationBgzipPath(gff3Path: string): string {
+    return /\.gff3\.gz$/i.test(gff3Path)
+        ? gff3Path.replace(/\.gff3\.gz$/i, ".gff3.bgz")
+        : gff3Path.replace(/\.gz$/i, ".bgz");
+}
+
+// Ensure a coordinate-sorted, bgzipped, tabix-indexed copy of the gff3 exists.
+// Idempotent: returns the .bgz path immediately if it (and its .tbi) are present.
+async function ensureAnnotationBgzip(gff3Path: string): Promise<string | null> {
+    const bgz = annotationBgzipPath(gff3Path);
+    const tbi = bgz + ".tbi";
+    try {
+        if (fs.existsSync(bgz) && fs.existsSync(tbi)) return bgz;
+    } catch { /* fall through to build */ }
+    if (_annotationBgzipInFlight[bgz]) return _annotationBgzipInFlight[bgz];
+
+    const build = (async (): Promise<string | null> => {
+        if (!(await hasTabix())) {
+            console.warn(`[annotations] tabix/bgzip unavailable — cannot build ${bgz}`);
+            return null;
+        }
+        console.log(`[annotations] building bgzip+tabix index -> ${bgz}`);
+        const tmp = bgz + ".tmp";
+        // Keep the header lines first, then coordinate-sort the feature lines
+        // (tabix requires -k1,1 -k4,4n order); stream straight into bgzip.
+        const shell =
+            `set -o pipefail; { zcat "${gff3Path}" | grep '^#' || true; ` +
+            `zcat "${gff3Path}" | grep -v '^#' | sort -k1,1 -k4,4n; } | bgzip -c > "${tmp}"`;
+        await new Promise<void>((resolve, reject) => {
+            const p = spawn("bash", ["-c", shell], { stdio: "ignore" });
+            p.on("error", reject);
+            p.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`bgzip build exit ${code}`))));
+        });
+        await new Promise<void>((resolve, reject) => {
+            const p = spawn("tabix", ["-p", "gff", tmp], { stdio: "ignore" });
+            p.on("error", reject);
+            p.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`tabix exit ${code}`))));
+        });
+        fs.renameSync(tmp, bgz);
+        if (fs.existsSync(tmp + ".tbi")) fs.renameSync(tmp + ".tbi", tbi);
+        console.log(`[annotations] index ready -> ${bgz}`);
+        return bgz;
+    })()
+        .catch((e: any) => {
+            console.error(`[annotations] bgzip build failed for ${gff3Path}:`, e?.message || e);
+            return null;
+        })
+        .finally(() => {
+            delete _annotationBgzipInFlight[bgz];
+        });
+
+    _annotationBgzipInFlight[bgz] = build;
+    return build;
+}
+
+// Build (or load a persisted sidecar of) the transcriptId -> {chr,start,end}
+// region index. The region is the min start / max end across all of a
+// transcript's features.
+async function buildOrLoadRegionIndex(species: string, gff3Path: string): Promise<void> {
+    const sidecar = annotationBgzipPath(gff3Path) + ".regionidx.tsv";
+    // Fast path: reuse a sidecar that is at least as new as the source gff3.
+    try {
+        if (fs.existsSync(sidecar) && fs.statSync(sidecar).mtimeMs >= fs.statSync(gff3Path).mtimeMs) {
+            const map = new Map<string, { chr: string; start: number; end: number }>();
+            await new Promise<void>((resolve, reject) => {
+                const rl = readline.createInterface({ input: fs.createReadStream(sidecar), crlfDelay: Infinity });
+                rl.on("line", (l: string) => {
+                    if (!l) return;
+                    const [id, chr, s, e] = l.split("\t");
+                    if (id && chr) map.set(id, { chr, start: +s, end: +e });
+                });
+                rl.on("close", () => resolve());
+                rl.on("error", reject);
+            });
+            annotationRegionIndex[species] = map;
+            console.log(`[annotations] ${species}: region index loaded from sidecar (${map.size} transcripts)`);
+            return;
+        }
+    } catch { /* rebuild below */ }
+
+    console.log(`[annotations] ${species}: building region index...`);
+    const map = new Map<string, { chr: string; start: number; end: number }>();
+    await new Promise<void>((resolve, reject) => {
+        const fileStream = fs.createReadStream(gff3Path);
+        fileStream.on("error", reject);
+        const input = gff3Path.endsWith(".gz") ? fileStream.pipe(zlib.createGunzip()) : fileStream;
+        input.on("error", reject);
+        const rl = readline.createInterface({ input, crlfDelay: Infinity });
+        rl.on("line", (line: string) => {
+            const parsed = parseGff3Line(line);
+            if (!parsed) return;
+            const s = +parsed.annotation.start;
+            const e = +parsed.annotation.end;
+            const chr = parsed.annotation.seqname;
+            if (!Number.isFinite(s) || !Number.isFinite(e)) return;
+            for (const id of parsed.ids) {
+                const cur = map.get(id);
+                if (!cur) map.set(id, { chr, start: s, end: e });
+                else {
+                    if (s < cur.start) cur.start = s;
+                    if (e > cur.end) cur.end = e;
+                }
+            }
+        });
+        rl.on("close", () => resolve());
+        rl.on("error", reject);
+    });
+    annotationRegionIndex[species] = map;
+
+    // Persist a sidecar so subsequent startups skip the scan (best-effort).
+    try {
+        const tmp = sidecar + ".tmp";
+        const ws = fs.createWriteStream(tmp);
+        for (const [id, r] of map) ws.write(`${id}\t${r.chr}\t${r.start}\t${r.end}\n`);
+        await new Promise<void>((res) => ws.end(() => res()));
+        fs.renameSync(tmp, sidecar);
+    } catch (e: any) {
+        console.warn(`[annotations] ${species}: region-index sidecar write failed:`, e?.message || e);
+    }
+    console.log(`[annotations] ${species}: region index built (${map.size} transcripts)`);
+}
+
+// Resolve a single transcript's features locally via tabix. Returns null when the
+// transcript isn't in the region index (caller then uses the Ensembl fallback).
+function queryAnnotationsTabix(species: string, transcriptId: string): Promise<Annotation[] | null> {
+    return new Promise(async (resolve) => {
+        const idx = annotationRegionIndex[species];
+        const bgz = annotationBgzPathBySpecies[species];
+        if (!idx || !bgz) return resolve(null);
+        const bare = transcriptId.includes(":")
+            ? transcriptId.slice(transcriptId.lastIndexOf(":") + 1)
+            : transcriptId;
+        const strippedId = stripDecimal(bare);
+        const region = idx.get(strippedId);
+        if (!region) return resolve(null);
+        try {
+            if (!fs.existsSync(bgz) || !(await hasTabix())) return resolve(null);
+        } catch { return resolve(null); }
+        const regionStr = `${region.chr}:${region.start}-${region.end}`;
+        const p = spawn("tabix", [bgz, regionStr]);
+        let buf = "";
+        p.stdout.on("data", (d: Buffer) => { buf += d.toString(); });
+        p.on("error", () => resolve(null));
+        p.on("close", () => {
+            const out: Annotation[] = [];
+            for (const line of buf.split("\n")) {
+                const parsed = parseGff3Line(line);
+                if (!parsed) continue;
+                if (parsed.ids.includes(strippedId)) out.push(parsed.annotation);
+            }
+            resolve(out.length ? out : null);
+        });
+    });
+}
+
 async function loadSpeciesAnnotations(species: string): Promise<void> {
     if (loadedSpecies.has(species)) return;
 
@@ -1374,15 +1582,18 @@ async function loadSpeciesAnnotations(species: string): Promise<void> {
 
     const p = (async () => {
         const filePath = await ensureSpeciesFile(species);
+        const resolved = path.isAbsolute(filePath) ? filePath : path.resolve(process.cwd(), filePath);
 
-        console.log(`[annotations] ${species}: loading annotations into memory`);
-        const loaded = await loadGFF3(filePath);
-
-        annotationsCache[species] = loaded;
+        console.log(`[annotations] ${species}: preparing on-demand tabix index`);
+        // Build (once) the bgzip+tabix copy, and the compact region index. Only
+        // the small region index is held in memory; features are read on demand.
+        const bgz = await ensureAnnotationBgzip(resolved);
+        if (bgz) annotationBgzPathBySpecies[species] = bgz;
+        await buildOrLoadRegionIndex(species, resolved);
         loadedSpecies.add(species);
 
         console.log(
-            `[annotations] ${species}: loaded ${Object.keys(loaded).length} transcript entries`
+            `[annotations] ${species}: ready (on-demand tabix, ${annotationRegionIndex[species]?.size ?? 0} transcripts indexed)`
         );
     })();
 
@@ -1560,7 +1771,8 @@ async function getTranscriptAnnotationsWithFallback(
     // (idempotent) and fall back to Ensembl REST for THIS request instead of
     // blocking on a potentially large / incomplete download+install.
     if (loadedSpecies.has(species)) {
-        const localAnnotations = annotationsCache[species]?.[strippedId];
+        // On-demand local lookup via tabix (region index in memory, features on disk).
+        const localAnnotations = await queryAnnotationsTabix(species, transcriptId);
         if (localAnnotations && localAnnotations.length > 0) {
             return localAnnotations;
         }
@@ -1673,9 +1885,11 @@ async function getTranscriptSequenceAndAnnotations(
     }
 
     // Was the annotation already available locally (before the fallback runs)?
+    // Local iff the species' region index is loaded and knows this transcript
+    // (queryAnnotationsTabix will then serve its features from disk).
     const hadLocalAnnotations =
         loadedSpecies.has(species) &&
-        !!(annotationsCache[species]?.[strippedId]?.length);
+        !!annotationRegionIndex[species]?.has(strippedId);
 
     // Step 2 and 3: local annotations, then REST fallback
     const annotations =
@@ -10758,15 +10972,11 @@ setInterval(() => {
 
 async function startServer() {
     try {
-        // Warm only HUMAN annotations at startup to cut peak heap during reference
-        // loading — the box (7.7 GB RAM, 6 GB V8 heap) was OOM-crash-looping while
-        // warming all species, which left referencesLoading=true forever and forced
-        // the Ensembl API annotation fallback. mouse/rat/yeast/dog stay in
-        // speciesRegistry so an explicit request for them can still lazy-load on demand.
-        const STARTUP_ANNOTATION_SKIP = ["mouse", "rat", "yeast", "dog"];
-        await initializeAnnotationCache(
-            Object.keys(speciesRegistry).filter((s) => !STARTUP_ANNOTATION_SKIP.includes(s))
-        );
+        // Annotations are now served on demand via bgzip+tabix (only a compact
+        // transcriptId->region index per species lives in memory), so warming all
+        // species no longer risks the OOM that forced a human-only startup. Load
+        // them all.
+        await initializeAnnotationCache();
     } catch (err) {
         console.error("[startup] Failed to initialize annotations:", err);
         process.exit(1);
