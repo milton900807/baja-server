@@ -5741,6 +5741,55 @@ app.post('/get-script', async (req, res) => {
     }
 });
 
+// A version that changes whenever the server (re)starts — i.e. on every deploy.
+// The frontend fetches this once and stamps it onto module URLs (?v=…) so that a
+// deploy busts the browser cache, while within a version modules cache forever.
+const APPS_VERSION = String(Date.now());
+app.get('/apps-version', (_req, res) => {
+    res.set('Cache-Control', 'public, max-age=15');
+    res.json({ version: APPS_VERSION });
+});
+
+// CACHEABLE module fetch (GET twin of POST /get-script). Same JSON shape, but the
+// browser can cache it: with a ?v=<version> cache-buster the response is immutable
+// (zero refetch on reload/revisit), so hundreds of per-module round-trips collapse
+// to disk-cache hits. Without ?v it falls back to a short max-age.
+app.get('/script', async (req, res) => {
+    try {
+        const spath: string = String(req.query.spath || '').trim();
+        let name: string = String(req.query.rule_name || req.query.name || '');
+        if (!spath || !name) return res.status(400).json({ error: 'spath and rule_name required' });
+        if (name.indexOf('.') <= 0) name = name + '.js';
+
+        const basePath = path.join(wd, spath);
+        const filePath = path.join(basePath, name);
+        const ext = name.split('.').pop() || 'lionscript';
+
+        const cacheKey = filePath;
+        const cached = scriptCache.get(cacheKey);
+        const cacheTTL = await getDynamicCacheTTL();
+
+        let data: string;
+        if (cached && Date.now() - cached.timestamp < cacheTTL) {
+            data = cached.data.rule_value;
+        } else {
+            await fs.promises.access(filePath, fs.constants.R_OK);
+            data = await fs.promises.readFile(filePath, 'utf-8');
+            scriptCache.set(cacheKey, {
+                data: { rule_type: ext, rule_name: name, spath: basePath, id: basePath, rule_value: data },
+                timestamp: Date.now(),
+            });
+        }
+
+        // Versioned URLs are immutable for a year; unversioned get a short cache.
+        if (req.query.v) res.set('Cache-Control', 'public, max-age=31536000, immutable');
+        else res.set('Cache-Control', 'public, max-age=60');
+        return res.json({ rule_type: ext, rule_name: name, spath: basePath, id: basePath, rule_value: data });
+    } catch (err) {
+        return res.status(404).json({ error: 'not found' });
+    }
+});
+
 app.post('/get-dev-script', async (req, res) => {
     console.log(req.body);
     let ppath = req.body.spath
