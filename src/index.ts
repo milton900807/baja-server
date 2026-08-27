@@ -2943,17 +2943,26 @@ app.get(['/stripe/subscription-status', '/api/stripe/subscription-status'], asyn
             });
         }
         // Early-access one-time purchase: there is no subscription object, so access is granted
-        // by a completed, paid Checkout in payment mode instead.
-        let oneTimePaid = false;
+        // by a completed, paid Checkout in payment mode — and it lasts ONE YEAR from the
+        // purchase date (the beta "$99 for one year" deal). We track the latest qualifying
+        // payment and expose its expiry as currentPeriodEnd.
+        let oneTimeExpiry: number | null = null;   // unix seconds
         try {
             const sessions = await stripeClient!.checkout.sessions.list({ customer: custId, limit: 100 });
-            oneTimePaid = sessions.data.some((s: any) =>
-                s.mode === 'payment' && s.status === 'complete' && s.payment_status === 'paid');
+            const ONE_YEAR = 365 * 24 * 3600;
+            const nowSec = Math.floor(Date.now() / 1000);
+            for (const s of sessions.data as any[]) {
+                if (s.mode === 'payment' && s.status === 'complete' && s.payment_status === 'paid' && s.created) {
+                    const exp = s.created + ONE_YEAR;
+                    if (exp > nowSec && (oneTimeExpiry == null || exp > oneTimeExpiry)) oneTimeExpiry = exp;
+                }
+            }
         } catch (e) { /* fall through to inactive */ }
+        const oneTimePaid = oneTimeExpiry != null;
         return res.json({
             active: oneTimePaid,
             status: oneTimePaid ? 'paid' : (subs.data[0]?.status || 'none'),
-            currentPeriodEnd: null,
+            currentPeriodEnd: oneTimeExpiry,
             customerId: custId,
         });
     } catch (e: any) {
