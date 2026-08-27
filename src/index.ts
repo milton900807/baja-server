@@ -2933,13 +2933,28 @@ app.get(['/stripe/subscription-status', '/api/stripe/subscription-status'], asyn
         if (!email) return res.status(400).json({ error: 'missing_email' });
         const customers = await stripeClient!.customers.list({ email, limit: 1 });
         if (!customers.data.length) return res.json({ active: false, status: 'none' });
-        const subs = await stripeClient!.subscriptions.list({ customer: customers.data[0].id, status: 'all', limit: 10 });
-        const active = subs.data.find(s => s.status === 'active' || s.status === 'trialing');
+        const custId = customers.data[0].id;
+        const subs = await stripeClient!.subscriptions.list({ customer: custId, status: 'all', limit: 10 });
+        const activeSub = subs.data.find(s => s.status === 'active' || s.status === 'trialing');
+        if (activeSub) {
+            return res.json({
+                active: true, status: activeSub.status,
+                currentPeriodEnd: activeSub.current_period_end, customerId: custId,
+            });
+        }
+        // Early-access one-time purchase: there is no subscription object, so access is granted
+        // by a completed, paid Checkout in payment mode instead.
+        let oneTimePaid = false;
+        try {
+            const sessions = await stripeClient!.checkout.sessions.list({ customer: custId, limit: 100 });
+            oneTimePaid = sessions.data.some((s: any) =>
+                s.mode === 'payment' && s.status === 'complete' && s.payment_status === 'paid');
+        } catch (e) { /* fall through to inactive */ }
         return res.json({
-            active: !!active,
-            status: active ? active.status : (subs.data[0]?.status || 'none'),
-            currentPeriodEnd: active ? active.current_period_end : null,
-            customerId: customers.data[0].id,
+            active: oneTimePaid,
+            status: oneTimePaid ? 'paid' : (subs.data[0]?.status || 'none'),
+            currentPeriodEnd: null,
+            customerId: custId,
         });
     } catch (e: any) {
         return res.status(500).json({ error: 'stripe_error', error_description: e?.message || String(e) });
@@ -2986,18 +3001,24 @@ app.post(['/stripe/create-checkout-session', '/api/stripe/create-checkout-sessio
         if (!email) return res.status(400).json({ error: 'missing_email' });
         const priceOrProduct = priceId || process.env.STRIPE_PRICE_ID;
         if (!priceOrProduct) return res.status(500).json({ error: 'no_price', error_description: 'Set STRIPE_PRICE_ID on the server (or pass priceId).' });
-        const price = await resolvePriceId(String(priceOrProduct));
+        const resolvedPriceId = await resolvePriceId(String(priceOrProduct));
+        // One-time prices can't run in subscription mode, so choose the checkout mode from the
+        // price itself: an annual subscription -> 'subscription', an early-access one-time -> 'payment'.
+        const priceObj = await stripeClient!.prices.retrieve(resolvedPriceId);
+        const isRecurring = !!priceObj.recurring;
 
         const base = String(appBase || req.headers.origin || '').replace(/\/$/, '');
         const back = returnPath || '/subscribe';
         const customer = await stripeCustomerFor(email, name);
 
         const session = await stripeClient!.checkout.sessions.create({
-            mode: 'subscription',
+            mode: isRecurring ? 'subscription' : 'payment',
             customer: customer.id,
-            line_items: [{ price, quantity: 1 }],
+            line_items: [{ price: resolvedPriceId, quantity: 1 }],
             allow_promotion_codes: true,
             client_reference_id: email,
+            metadata: { email, plan: isRecurring ? 'subscription' : 'early-access' },
+            ...(isRecurring ? {} : { payment_intent_data: { metadata: { email, plan: 'early-access' } } }),
             success_url: `${base}${back}?status=success&session_id={CHECKOUT_SESSION_ID}`,
             cancel_url: `${base}${back}?status=cancel`,
         });
