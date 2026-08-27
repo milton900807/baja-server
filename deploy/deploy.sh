@@ -166,6 +166,14 @@ if want_be; then
   else
     c "Skipping server dep install (--skip-deps)"
   fi
+
+  # Exec venv (/opt/venv): the server spawns python3 from here for every exec('.py').
+  # Ensure it has the runtime wheels AND the local editable packages (ion, bajasplice,
+  # bajaclip, djprimer). Runs AFTER the apps are synced (so the */-lib sources exist)
+  # and BEFORE the service restart below, so they're importable at boot. Non-fatal.
+  c "Ensuring exec venv (/opt/venv) has wheels + local libs (ion/bajasplice/bajaclip/djprimer)…"
+  on_remote "PY=/opt/venv/bin/python3; sudo \$PY -m pip install --no-input -r '$REMOTE_API/deploy/venv-requirements.txt'; for lib in ion-lib bajasplice-lib bajaclip-lib djprimer-lib; do [ -d '$REMOTE_APPS/py/'\$lib ] && sudo \$PY -m pip install --no-input --no-deps -e '$REMOTE_APPS/py/'\$lib; done" \
+    && ok "exec venv ready" || printf '\033[1;33m! exec venv setup had issues (non-fatal)\033[0m\n'
 fi
 
 # ---- 5. data resources (default ON) ----------------------------------------
