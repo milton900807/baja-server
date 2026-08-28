@@ -6784,7 +6784,10 @@ app.post('/save-user-data', async (req, res) => {
 
 
 
-        res.json({ 'status': 'saved', 'path': '/' + decodeEmail(user) + '/' + ppath + '/' + req.body.name });
+        // Return the path with the user's FOLDER ID (encodeEmail'd, `user` is already encoded
+        // here) rather than the decoded email — so the email never appears in the saved path /
+        // share link / browser URL, and the owner's own-file load resolves directly.
+        res.json({ 'status': 'saved', 'path': '/' + user + '/' + ppath + '/' + req.body.name });
     } else {
         console.log(' no user ');
         return res.json({ 'status': 'Must be logged in' });
