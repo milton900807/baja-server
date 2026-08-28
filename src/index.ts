@@ -1720,6 +1720,37 @@ function annotationKey(species: string, transcriptId: string): string {
     return `${species}:${stripDecimal(transcriptId)}`;
 }
 
+// -----------------------------------------------------------------------------------------
+// Persistent transcript cache (local "database"): survives restarts so a transcript that was
+// once resolved via the Ensembl/EBI REST site is served from disk instead of re-fetching it.
+// One JSON file per (species:transcript) under reference_data/ensembl_cache/transcripts/,
+// mirroring the existing region-scoped dbSNP file cache. Only Ensembl/EBI-sourced transcripts
+// are written (local ones are already fast); reads warm the in-memory cache.
+// -----------------------------------------------------------------------------------------
+function transcriptCacheDir(): string { return path.resolve('reference_data', 'ensembl_cache', 'transcripts'); }
+function transcriptCacheFile(resultKey: string): string {
+    const safe = String(resultKey).replace(/[^A-Za-z0-9._:-]/g, '_').replace(/:/g, '__');
+    return path.join(transcriptCacheDir(), `${safe}.json`);
+}
+function readTranscriptDiskCache(resultKey: string): TranscriptPayload | null {
+    try {
+        const f = transcriptCacheFile(resultKey);
+        if (!fs.existsSync(f)) return null;
+        const p = JSON.parse(fs.readFileSync(f, 'utf8'));
+        return (p && typeof p === 'object' && p.sequence) ? (p as TranscriptPayload) : null;
+    } catch { return null; }
+}
+function writeTranscriptDiskCache(resultKey: string, payload: TranscriptPayload): void {
+    try {
+        fs.mkdirSync(transcriptCacheDir(), { recursive: true });
+        // Write atomically (tmp + rename) so a crash mid-write can't leave a corrupt file.
+        const f = transcriptCacheFile(resultKey);
+        const tmp = `${f}.tmp`;
+        fs.writeFileSync(tmp, JSON.stringify(payload));
+        fs.renameSync(tmp, f);
+    } catch { /* best-effort cache; never fail the request over it */ }
+}
+
 function mapStrand(strand: number | string | null | undefined): string {
     if (strand === -1 || strand === "-1" || strand === "-") return "-";
     if (strand === 1 || strand === "1" || strand === "+") return "+";
@@ -2008,6 +2039,19 @@ async function getTranscriptSequenceAndAnnotations(
         return { ...cachedResult, species, referencesLoading };
     }
 
+    // Step 1b: persistent on-disk cache — a transcript previously resolved via the
+    // Ensembl/EBI REST site is served from the local store instead of hitting REST
+    // again. Only checked when the local reference is ready (matching the write
+    // guard below), so a genuinely-local transcript is never shadowed by a stale
+    // remote copy. Warms the in-memory cache on a hit.
+    if (!referencesLoading) {
+        const diskCached = readTranscriptDiskCache(resultKey);
+        if (diskCached) {
+            transcriptResultCache[resultKey] = diskCached;
+            return { ...diskCached, species, referencesLoading };
+        }
+    }
+
     // Was the annotation already available locally (before the fallback runs)?
     // Local iff the species' region index is loaded and knows this transcript
     // (queryAnnotationsTabix will then serve its features from disk).
@@ -2103,6 +2147,13 @@ async function getTranscriptSequenceAndAnnotations(
     // means the next request (once loaded) re-resolves against local data.
     if (sequence && sequence.length > 0 && !referencesLoading) {
         transcriptResultCache[resultKey] = payload;
+        // Persist to the local database ONLY when this transcript was resolved via the
+        // Ensembl/EBI REST site (not available locally) — so future requests, even after
+        // a restart, skip the remote site. Local transcripts are already fast and are
+        // left out to avoid pinning them to a snapshot.
+        if (payload.annotationSource === "ensembl" || payload.sequenceSource === "ensembl") {
+            writeTranscriptDiskCache(resultKey, payload);
+        }
     }
     return payload;
 }
