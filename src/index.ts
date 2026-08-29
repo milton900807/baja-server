@@ -165,6 +165,19 @@ app.get(['/transcript/:transcriptId', '/api/ensembl/transcript/:transcriptId'], 
 
         return res.json(result);
     } catch (error: any) {
+        // A retired/invalid Ensembl id (400/404 "not found") degrades to an empty-but-valid
+        // payload with 200, so the client renders "no data" instead of throwing on a 500.
+        if (error?.notFound) {
+            console.warn(`transcript: ensembl id not found → ${req.params.transcriptId} (${error?.message || error})`);
+            return res.json({
+                transcriptId: req.params.transcriptId,
+                sequence: '',
+                annotations: [],
+                sequenceSource: 'none',
+                annotationSource: 'none',
+                notFound: true,
+            });
+        }
         console.error('Error loading transcript sequence/annotations:', error);
         return res.status(500).json({
             error: 'Failed to load transcript sequence and annotations',
@@ -183,6 +196,13 @@ app.get(['/api/ensembl/lookup/:id', '/ensembl/lookup/:id'], async (req: any, res
         const lookup = await fetchTranscriptLookup(id, prefix);
         return res.json(lookup);
     } catch (error: any) {
+        // Genuine "ID not found" (Ensembl 400/404 for a retired/invalid transcript) is not a
+        // server failure — answer 200 with a benign not-found body so the browser doesn't throw
+        // an HttpErrorResponse. Real outages still surface as 502.
+        if (error?.notFound) {
+            console.warn(`ensembl lookup: id not found → ${req.params.id} (${error?.message || error})`);
+            return res.status(200).json({ notFound: true, id: String(req.params.id || ''), error: 'ensembl id not found' });
+        }
         return res.status(502).json({ error: error?.message || String(error) });
     }
 });
@@ -194,6 +214,12 @@ app.get(['/api/ensembl/sequence/:id', '/ensembl/sequence/:id'], async (req: any,
         const seq = await fetchEnsemblSequence(id, prefix);
         return res.type('text/plain').send(seq);
     } catch (error: any) {
+        // Not-found ID → empty sequence with 200 (the client treats empty as "no sequence"),
+        // so a retired/invalid ID doesn't throw. Real outages still return 502.
+        if (error?.notFound) {
+            console.warn(`ensembl sequence: id not found → ${req.params.id} (${error?.message || error})`);
+            return res.type('text/plain').send('');
+        }
         return res.status(502).json({ error: error?.message || String(error) });
     }
 });
@@ -1675,12 +1701,14 @@ async function ensemblFetch(
     maxAttempts = 3
 ): Promise<any> {
     let lastStatus = "";
+    let lastStatusCode = 0;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         let response: any;
         try {
             response = await fetch(url, { headers });
         } catch (netErr: any) {
             lastStatus = `network error: ${netErr?.message || netErr}`;
+            lastStatusCode = 0;
             if (attempt < maxAttempts) {
                 await new Promise((r) => setTimeout(r, attempt * 1000));
                 continue;
@@ -1691,6 +1719,7 @@ async function ensemblFetch(
         if (response.ok) return response;
 
         lastStatus = `${response.status} ${response.statusText}`;
+        lastStatusCode = response.status;
         if (TRANSIENT_HTTP.has(response.status) && attempt < maxAttempts) {
             const retryAfter = Number(response.headers.get("Retry-After")) || attempt;
             await new Promise((r) => setTimeout(r, Math.min(retryAfter, 5) * 1000));
@@ -1698,7 +1727,12 @@ async function ensemblFetch(
         }
         break;
     }
-    throw new Error(`${lastStatus} (${url})`);
+    // Tag the error with the HTTP status so callers can tell a genuine "ID not found"
+    // (Ensembl answers 400/404 for retired/invalid IDs) apart from a real outage.
+    const err: any = new Error(`${lastStatus} (${url})`);
+    err.status = lastStatusCode;
+    err.notFound = lastStatusCode === 400 || lastStatusCode === 404;
+    throw err;
 }
 
 async function fetchEnsemblSequence(

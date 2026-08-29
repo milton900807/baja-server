@@ -1,0 +1,16 @@
+
+# Locally-built off-target 2-bit/seed indexes (large, regenerated on demand)
+reference_data/offtarget_index/
+
+# Secrets — never commit
+.env
+.env.*
+
+# Dependencies / build output
+node_modules/
+dist/
+
+# Local logs
+*.log
+local-server.log
+deploy/local-server.log
