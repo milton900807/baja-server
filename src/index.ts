@@ -6300,6 +6300,19 @@ app.post('/share-alias', (req, res) => {
     }
 });
 
+// Short public alias for the read-only Clinical Compound Library.
+//   /library                -> the shelf
+//   /library/<compound_id>  -> that compound, loaded straight away
+// nginx sends /app|/login|/auth|... to the SPA and everything else through to this API
+// (try_files $uri $uri/ @api), so a bare path like /library reaches express and can redirect
+// into the SPA route. Kept as a redirect rather than a second entry point so there is still
+// exactly one implementation behind it.
+app.get(['/library', '/library/:compound'], (req, res) => {
+    const compound = String((req.params as any).compound || '').trim();
+    const base = '/app/manchester/clinical-library-public';
+    return res.redirect(302, compound ? (base + '?compound=' + encodeURIComponent(compound)) : base);
+});
+
 // Resolve a short code -> the view-only viewer, carrying only the CODE (never the
 // underlying path, which contains the owner's email) so nothing is exposed in the URL.
 app.get('/s/:code', (req, res) => {
