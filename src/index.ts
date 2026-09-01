@@ -6505,10 +6505,13 @@ async function freeGate(req: any, metric: 'design' | 'offtarget'): Promise<any |
             used: (used as any)[metric],
             limit: FREE_LIMIT,
             resetsOn: periodResetsOn(),
+            // The off-target line is deliberately short and light: it is shown on the canvas
+            // mid-run, where a sentence about allowances and reset dates reads as a failure.
+            // resetsOn is still in the payload for anything that wants to spell it out.
             message: (metric === 'design'
                 ? 'You have used all ' + FREE_LIMIT + ' free designs this month.'
-                : 'You have used all ' + FREE_LIMIT + ' free off-target searches this month.')
                 + ' Your allowance resets on ' + periodResetsOn() + ' — or subscribe for unlimited use.'
+                : 'No more free GPU time.  ;-)')
         };
     }
     const all = loadFreeUsage();
