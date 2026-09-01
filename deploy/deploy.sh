@@ -105,7 +105,7 @@ fi
 
 # ---- 2. ensure remote dirs exist --------------------------------------------
 c "Preparing remote directories…"
-on_remote "sudo mkdir -p '$REMOTE_WEB' '$REMOTE_API' '$REMOTE_APPS' '$REMOTE_DATA' && sudo chown -R \$(whoami) '$REMOTE_WEB' '$REMOTE_API' '$REMOTE_APPS'"
+on_remote "sudo mkdir -p '$REMOTE_WEB' '$REMOTE_API' '$REMOTE_API/deploy' '$REMOTE_APPS' '$REMOTE_DATA' && sudo chown -R \$(whoami) '$REMOTE_WEB' '$REMOTE_API' '$REMOTE_APPS'"
 
 # ---- 3. sync frontend -------------------------------------------------------
 if want_fe; then
@@ -171,6 +171,13 @@ if want_be; then
   # Ensure it has the runtime wheels AND the local editable packages (ion, bajasplice,
   # bajaclip, djprimer, bajair). Runs AFTER the apps are synced (so the */-lib sources exist)
   # and BEFORE the service restart below, so they're importable at boot. Non-fatal.
+  # The API sync above excludes deploy/, so venv-requirements.txt never reached the server and
+  # the `pip install -r` below was failing silently on a missing file — masked because the
+  # shell sequence returns the status of the LAST command (the editable-install loop), so the
+  # step still reported success. Ship just that one file first.
+  "${RSYNC[@]}" "$HERE/venv-requirements.txt" "$SERVER:$REMOTE_API/deploy/venv-requirements.txt" \
+    || printf '\033[1;33m! could not sync venv-requirements.txt\033[0m\n'
+
   c "Ensuring exec venv (/opt/venv) has wheels + local libs (ion/bajasplice/bajaclip/djprimer/bajair)…"
   on_remote "PY=/opt/venv/bin/python3; sudo \$PY -m pip install --no-input -r '$REMOTE_API/deploy/venv-requirements.txt'; for lib in ion-lib bajasplice-lib bajaclip-lib djprimer-lib bajair-lib; do [ -d '$REMOTE_APPS/py/'\$lib ] && sudo \$PY -m pip install --no-input --no-deps -e '$REMOTE_APPS/py/'\$lib; done" \
     && ok "exec venv ready" || printf '\033[1;33m! exec venv setup had issues (non-fatal)\033[0m\n'
