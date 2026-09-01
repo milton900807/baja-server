@@ -4724,6 +4724,11 @@ app.get('/genomes', (_req: any, res: any) => {
 });
 
 app.post('/off-targets-file', async (req, res) => {
+    // Free tier: 5 off-target searches, then subscribe. No-op for subscribers.
+    try {
+        const gate = freeGate(req, 'offtarget');
+        if (gate) return res.status(402).json(gate);
+    } catch (e) { /* metering must never block a subscriber's search */ }
     const uuid = Math.floor(Date.now() / 1000);
     const inputfile = inputtemplate + uuid + '.json';
     const resultsfile = resultstemplate + uuid + '.out.json';
@@ -6262,6 +6267,106 @@ app.get('/script', async (req, res) => {
 // Map a short code -> a long shared .baja path so a view-only link can be
 // oligodesigner.com/s/<code> instead of /app/manchester/viewer?path=<long hex>.
 const SHARE_ALIAS_FILE = path.join(userData, 'share-aliases.json');
+
+// ---------------------------------------------------------------------------------------
+// FREE-TIER METERING
+//
+// free/editor.js gives non-subscribers the full editor — load, edit, save, design — but the
+// two operations with a real per-call cost are capped: Anthropic-backed python tools and
+// off-target searches. Subscribers are unlimited.
+//
+// Enforced HERE rather than in the client. The client shows the remaining count and the
+// upgrade prompt, but a browser-side counter is trivially reset from devtools, so the limit
+// would mean nothing. Keyed by the signed-in email: production runs auth = 'b2c', so every
+// user (free included) has an identity to meter against.
+// ---------------------------------------------------------------------------------------
+const FREE_LIMIT = 5;
+const FREE_USAGE_FILE = path.join(userData, 'free-usage.json');
+type FreeUsage = { [email: string]: { ai: number; offtarget: number } };
+let __freeUsage: FreeUsage | null = null;
+
+function loadFreeUsage(): FreeUsage {
+    if (__freeUsage) return __freeUsage;
+    try { __freeUsage = JSON.parse(fs.readFileSync(FREE_USAGE_FILE, 'utf-8')) || {}; }
+    catch { __freeUsage = {}; }
+    return __freeUsage as FreeUsage;
+}
+function saveFreeUsage(): void {
+    try { fs.writeFileSync(FREE_USAGE_FILE, JSON.stringify(__freeUsage || {})); }
+    catch (e) { console.error('free-usage save failed:', e); }
+}
+function freeUserKey(req: any): string {
+    return String(
+        (req && req.headers && (req.headers['x-user-id'] || req.headers.user)) ||
+        (req && req.query && req.query.user) ||
+        (req && req.body && req.body.user) || ''
+    ).trim().toLowerCase();
+}
+function freeUsedFor(email: string): { ai: number; offtarget: number } {
+    const all = loadFreeUsage();
+    return all[email] || { ai: 0, offtarget: 0 };
+}
+// The python tools that spend Anthropic credit. Matched on the script path so a new AI tool
+// has to be added here deliberately rather than being metered (or missed) by accident.
+const AI_METERED = [
+    'prompt-to-transcript.py', 'extract-entities.py', 'points-of-interest.py',
+    'prompt-action.py', 'prompt-to-variant.py', 'design-helm-chemistry.py'
+];
+function isAiScript(p: string): boolean {
+    const s = String(p || '');
+    return AI_METERED.some((n) => s.indexOf(n) >= 0);
+}
+// A subscriber is never metered. Reuses the same license/subscription state /verify-user
+// reports, so free-tier and access control cannot drift apart.
+function isSubscribed(email: string): boolean {
+    if (!email) return false;
+    try {
+        // Same call /verify-user makes, so free-tier and access control read one source of
+        // truth and cannot drift apart. 'bajabio-Designer' is the editor's product name.
+        const r = determineLicenseStatus(email, 'bajabio-Designer', normalizePosition(undefined), configPath);
+        return isLicenseAllowed(r);
+    } catch (e) { return false; }
+}
+/** Returns null when the call may proceed, or a payload to send with 402 when it may not. */
+function freeGate(req: any, metric: 'ai' | 'offtarget'): any | null {
+    const email = freeUserKey(req);
+    if (!email) return null;                 // unidentified: not metered here
+    if (isSubscribed(email)) return null;    // subscribers are unlimited
+    const used = freeUsedFor(email);
+    if ((used as any)[metric] >= FREE_LIMIT) {
+        return {
+            error: 'free-limit',
+            metric: metric,
+            used: (used as any)[metric],
+            limit: FREE_LIMIT,
+            message: metric === 'ai'
+                ? 'You have used all ' + FREE_LIMIT + ' free AI requests. Subscribe to continue.'
+                : 'You have used all ' + FREE_LIMIT + ' free off-target searches. Subscribe to continue.'
+        };
+    }
+    const all = loadFreeUsage();
+    if (!all[email]) all[email] = { ai: 0, offtarget: 0 };
+    (all[email] as any)[metric] += 1;
+    saveFreeUsage();
+    return null;
+}
+
+// What the client shows as "N of 5 used" and uses to decide whether to offer the upgrade.
+app.get('/free-quota', (req, res) => {
+    try {
+        const email = freeUserKey(req);
+        const subscribed = isSubscribed(email);
+        const used = freeUsedFor(email);
+        return res.json({
+            user: email, subscribed: subscribed, limit: FREE_LIMIT,
+            ai: used.ai, offtarget: used.offtarget,
+            aiRemaining: subscribed ? -1 : Math.max(0, FREE_LIMIT - used.ai),
+            offtargetRemaining: subscribed ? -1 : Math.max(0, FREE_LIMIT - used.offtarget)
+        });
+    } catch (e: any) {
+        return res.json({ error: String(e && e.message || e), limit: FREE_LIMIT });
+    }
+});
 let __shareAliases: { [code: string]: string } | null = null;
 function loadShareAliases(): { [code: string]: string } {
     if (__shareAliases) return __shareAliases;
@@ -8116,7 +8221,14 @@ function resolveUserPath(incomingPath: string): string {
 
 const ppath = async (req: {
     [x: string]: any; path: any; query: { args: string; };
-}, res: { json: (arg0: { path: unknown; }) => void; }) => {
+}, res: any) => {
+    // Same free-tier gate as the POST bridge: the AI tools are reachable both ways.
+    try {
+        if (isAiScript(req.path)) {
+            const gate = freeGate(req, 'ai');
+            if (gate) return res.status(402).json(gate);
+        }
+    } catch (e) { }
     let t = req.path;
     t = t.trim();
     if (t.startsWith('/ionworks')) {
@@ -8209,9 +8321,18 @@ const ppath = async (req: {
     return res.json({ path: filePath });
 }
 
-const post_ppath = async (req: { path: any; body: any; headers: { [x: string]: any; }; }, res: { json: (arg0: { path: unknown; }) => any; }) => {
+const post_ppath = async (req: { path: any; body: any; headers: { [x: string]: any; }; }, res: any) => {
     const path = req.path;
     const value = req.body;
+
+    // Free tier: 5 Anthropic-backed runs, then subscribe. Only the scripts in AI_METERED
+    // count — every other python tool stays unmetered.
+    try {
+        if (isAiScript(path)) {
+            const gate = freeGate(req, 'ai');
+            if (gate) return res.status(402).json(gate);
+        }
+    } catch (e) { /* never block on a metering failure */ }
 
     let t = path.trim();
 
