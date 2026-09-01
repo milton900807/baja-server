@@ -12,6 +12,9 @@
 #   joblib       -> predict_solubility  (py/bio/protein/predict_solubility.py)
 #   pyBigWig     -> RNA-seq rendering    (py/baja/bigwig/view-bigwig.py)
 #   pyfaidx      -> bajasplice.genome    (py/bajasplice-lib/bajasplice/genome.py)
+#   pysam        -> bajair               (py/bajair-lib/bajair) — the libs are installed with
+#                   --no-deps, so anything a py/*-lib declares must ALSO be listed here or the
+#                   package installs cleanly and then fails at import.
 numpy>=1.26
 requests>=2.25
 pandas>=2.0
@@ -19,6 +22,7 @@ scikit-learn>=1.3
 joblib>=1.3
 pyBigWig>=0.3.22
 pyfaidx>=0.7
+pysam>=0.22
 #
 # Editable local packages (ion, bajasplice, bajaclip, djprimer) are NOT wheels and
 # live under baja-apps/py/*-lib, so they can't be pinned here. They are installed
