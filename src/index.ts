@@ -1231,9 +1231,36 @@ function pyRelease(): void {
     if (next) next();                       // hand the slot to the next waiter (active count unchanged)
     else __pyActive = Math.max(0, __pyActive - 1);
 }
+// ---- Cancellable python jobs ----------------------------------------------
+// Every user-triggered python subprocess is registered here while it runs, so a client can
+// ask for one to be killed. Without this a "cancel" button can only stop the browser waiting:
+// the work carries on holding a concurrency slot and a CPU until it finishes on its own.
+//
+// Identified by SCRIPT + USER rather than by an id handed back to the caller: the client's
+// exec path is rebuilt from `new URL(path).pathname`, which drops any query string, so there
+// is nowhere to carry an id out to the browser and back. The user scopes it so one person's
+// cancel cannot reach into another's run.
+type PyJob = { id: string; proc: any; script: string; user: string; startedAt: number };
+const __pyJobs = new Map<string, PyJob>();
+let __pyJobSeq = 0;
+
+function __pyJobRegister(proc: any, meta: { script?: string; user?: string }): string {
+    const id = 'job' + (++__pyJobSeq) + '-' + Date.now().toString(36);
+    __pyJobs.set(id, {
+        id,
+        proc,
+        script: ('' + (meta && meta.script || '')).trim(),
+        user: ('' + (meta && meta.user || '')).trim().toLowerCase(),
+        startedAt: Date.now(),
+    });
+    const drop = () => { try { __pyJobs.delete(id); } catch { } };
+    try { proc.on('close', drop); proc.on('error', drop); } catch { }
+    return id;
+}
+
 // Acquire a slot, spawn python, and guarantee the slot is released on close/error
 // or after a hard runtime cap (kills a hung job so it can't hold a slot forever).
-async function spawnPythonGated(args: string[], opts: any): Promise<any> {
+async function spawnPythonGated(args: string[], opts: any, meta?: { script?: string; user?: string }): Promise<any> {
     await pyAcquire();
     let released = false;
     const release = () => { if (!released) { released = true; pyRelease(); } };
@@ -1244,6 +1271,7 @@ async function spawnPythonGated(args: string[], opts: any): Promise<any> {
         release();
         throw e;
     }
+    if (meta) { try { __pyJobRegister(proc, meta); } catch { } }
     const killT = setTimeout(() => {
         try { console.warn("[py-cap] killing python after runtime cap (" + (PY_MAX_RUNTIME_MS / 1000) + "s)"); proc.kill("SIGKILL"); } catch { }
     }, PY_MAX_RUNTIME_MS);
@@ -1251,6 +1279,64 @@ async function spawnPythonGated(args: string[], opts: any): Promise<any> {
     proc.on("error", () => { clearTimeout(killT); release(); });
     return proc;
 }
+
+// What is running right now. Useful on its own for seeing whether a cancel actually landed.
+app.get('/py-jobs', (req: any, res: any) => {
+    const user = ('' + (req.query.user || '')).trim().toLowerCase();
+    const now = Date.now();
+    const rows: any[] = [];
+    __pyJobs.forEach((j) => {
+        if (user && j.user && j.user !== user) return;
+        rows.push({ id: j.id, script: j.script, user: j.user, ageMs: now - j.startedAt });
+    });
+    res.json({ jobs: rows, active: __pyActive, queued: __pyQueue.length });
+});
+
+// Kill a running job. By id, or by script (+ user) for a client that never received an id.
+// SIGTERM first so python can unwind, SIGKILL shortly after for anything that ignores it.
+app.post('/py-cancel', (req: any, res: any) => {
+    const body = req.body || {};
+    const id = ('' + (body.id || '')).trim();
+    const script = ('' + (body.script || '')).trim();
+    const user = ('' + (body.user || '')).trim().toLowerCase();
+
+    const targets: PyJob[] = [];
+    if (id) {
+        const j = __pyJobs.get(id);
+        if (j) targets.push(j);
+    } else if (script) {
+        // The user's most recent run of that script. Newest first so a cancel hits the run the
+        // user is actually looking at, not an older one that happens to share the script.
+        const matches: PyJob[] = [];
+        __pyJobs.forEach((j) => {
+            if (!j.script || j.script.indexOf(script) < 0) return;
+            // A job that recorded a user is only cancellable BY that user. One that recorded
+            // none is anonymous and stays cancellable, or nothing started before this change
+            // could ever be stopped.
+            if (j.user && user && j.user !== user) return;
+            if (j.user && !user) return;
+            matches.push(j);
+        });
+        matches.sort((a, b) => b.startedAt - a.startedAt);
+        if (matches.length) targets.push(matches[0]);
+    }
+
+    if (!targets.length) return res.json({ cancelled: 0, reason: 'no matching running job' });
+
+    let n = 0;
+    for (const j of targets) {
+        try {
+            j.proc.kill('SIGTERM');
+            setTimeout(() => { try { j.proc.kill('SIGKILL'); } catch { } }, 2000);
+            __pyJobs.delete(j.id);
+            n++;
+            console.warn('[py-cancel] killed', j.id, j.script, 'for', j.user || '(anonymous)');
+        } catch (e) {
+            console.warn('[py-cancel] could not kill', j.id, e);
+        }
+    }
+    res.json({ cancelled: n });
+});
 
 // Run the local off-target search (spawn search.py, parse its single
 // IONWORKS:RESOLUTION line synchronously) and resolve the oligoQuery result.
@@ -3044,9 +3130,12 @@ app.get(['/stripe/subscription-status', '/api/stripe/subscription-status'], asyn
             }
         } catch (e) { /* fall through to inactive */ }
         const oneTimePaid = oneTimeExpiry != null;
+        const __status = oneTimePaid ? 'paid' : (subs.data[0]?.status || 'none');
+        __logSubscriptionCheck('stripe', ('' + ((req.query && (req.query.email || req.query.user)) || '')),
+            oneTimePaid, 'via=stripe status=' + __status + ' customer=' + (custId || '(none)'));
         return res.json({
             active: oneTimePaid,
-            status: oneTimePaid ? 'paid' : (subs.data[0]?.status || 'none'),
+            status: __status,
             currentPeriodEnd: oneTimeExpiry,
             customerId: custId,
         });
@@ -4726,7 +4815,7 @@ app.get('/genomes', (_req: any, res: any) => {
 app.post('/off-targets-file', async (req, res) => {
     // Free tier: 5 off-target searches, then subscribe. No-op for subscribers.
     try {
-        const gate = freeGate(req, 'offtarget');
+        const gate = await freeGate(req, 'offtarget');
         if (gate) return res.status(402).json(gate);
     } catch (e) { /* metering must never block a subscriber's search */ }
     const uuid = Math.floor(Date.now() / 1000);
@@ -6316,39 +6405,98 @@ function freeUserKey(req: any): string {
         (req && req.body && req.body.user) || ''
     ).trim().toLowerCase();
 }
-function freeUsedFor(email: string): { ai: number; offtarget: number } {
+function freeUsedFor(email: string): { design: number; offtarget: number } {
     const all = loadFreeUsage();
-    const rec = all[email];
+    const rec: any = all[email];
     // A row from a previous month — or a pre-monthly row with no period — reads as unused.
-    if (!rec || rec.period !== currentPeriod()) return { ai: 0, offtarget: 0 };
-    return { ai: rec.ai || 0, offtarget: rec.offtarget || 0 };
+    if (!rec || rec.period !== currentPeriod()) return { design: 0, offtarget: 0 };
+    // `ai` is the old name for this counter. Carried over rather than dropped, so nobody gets a
+    // fresh allowance just because the meter was renamed mid-month.
+    return { design: rec.design || rec.ai || 0, offtarget: rec.offtarget || 0 };
 }
-// The python tools that spend Anthropic credit. Matched on the script path so a new AI tool
-// has to be added here deliberately rather than being metered (or missed) by accident.
-const AI_METERED = [
-    'prompt-to-transcript.py', 'extract-entities.py', 'points-of-interest.py',
-    'prompt-action.py', 'prompt-to-variant.py', 'design-helm-chemistry.py'
+// The metered work is DESIGNS -- siRNA and single-stranded ASO. Those are the calls with real
+// cost behind them and the thing a free user is trying out, so they are what the allowance
+// counts. AI tools used to be metered here instead and are now unlimited.
+//
+// Matched on the script path so a new designer has to be added deliberately rather than being
+// metered (or missed) by accident.
+const DESIGN_METERED = [
+    'sirna/design.py', 'ssaso/design.py', 'ssaso/design-steric-blocking.py'
 ];
-function isAiScript(p: string): boolean {
+function isDesignScript(p: string): boolean {
     const s = String(p || '');
-    return AI_METERED.some((n) => s.indexOf(n) >= 0);
+    return DESIGN_METERED.some((n) => s.indexOf(n) >= 0);
 }
 // A subscriber is never metered. Reuses the same license/subscription state /verify-user
 // reports, so free-tier and access control cannot drift apart.
-function isSubscribed(email: string): boolean {
-    if (!email) return false;
+// STRIPE IS THE ONLY SOURCE OF ENTITLEMENT.
+//
+// This used to read the licence files under config/subscriptions, every one of which carries a
+// PayPal-era subscriptionId. Those grants are gone: an account is subscribed if and only if
+// Stripe says it has an active subscription.
+//
+// Consequences worth knowing, because they are not small:
+//   * The ~83 accounts whose entitlement came from a licence file are now metered like anyone
+//     else. Their files are left on disk untouched -- nothing is deleted, so restoring the old
+//     behaviour is a code change, not a data recovery.
+//   * Answering needs a Stripe API call, so this is async. Callers await it.
+//
+// Cached briefly: the client polls /free-quota every 20 seconds per open tab, and hitting
+// Stripe on each poll would be both slow and rude. 60s is short enough that a new subscription
+// takes effect almost immediately.
+const __subCache = new Map<string, { active: boolean; at: number }>();
+const SUB_CACHE_MS = 60_000;
+
+async function subscriptionSource(email: string): Promise<{ allowed: boolean; via: string; detail: string }> {
+    const key = ('' + (email || '')).trim().toLowerCase();
+    if (!key || key.indexOf('@') < 0) return { allowed: false, via: 'none', detail: 'no-email' };
+
+    const hit = __subCache.get(key);
+    if (hit && (Date.now() - hit.at) < SUB_CACHE_MS) {
+        return { allowed: hit.active, via: 'stripe', detail: 'cached' };
+    }
+
+    if (!stripeClient) {
+        // Stripe not configured. Fail CLOSED -- with Stripe as the only source, "cannot ask"
+        // cannot mean "yes", or the gate would open whenever the integration is misconfigured.
+        return { allowed: false, via: 'stripe', detail: 'stripe_not_configured' };
+    }
+
     try {
-        // Same call /verify-user makes, so free-tier and access control read one source of
-        // truth and cannot drift apart. 'bajabio-Designer' is the editor's product name.
-        const r = determineLicenseStatus(email, 'bajabio-Designer', normalizePosition(undefined), configPath);
-        return isLicenseAllowed(r);
-    } catch (e) { return false; }
+        const customers = await stripeClient.customers.list({ email: key, limit: 1 });
+        const cust = customers.data[0];
+        if (!cust) {
+            __subCache.set(key, { active: false, at: Date.now() });
+            return { allowed: false, via: 'stripe', detail: 'no_customer' };
+        }
+        const subs = await stripeClient.subscriptions.list({
+            customer: cust.id, status: 'all', limit: 10,
+        });
+        // 'active' and 'trialing' are the statuses that entitle. past_due / incomplete /
+        // incomplete_expired / canceled do not.
+        const good = subs.data.find((x: any) => x.status === 'active' || x.status === 'trialing');
+        const active = !!good;
+        __subCache.set(key, { active, at: Date.now() });
+        return {
+            allowed: active,
+            via: 'stripe',
+            detail: (good && good.status) || (subs.data[0] && subs.data[0].status) || 'none',
+        };
+    } catch (e: any) {
+        // An API error is not proof of anything, but with one source there is nothing to fall
+        // back to. Fail closed and say why, rather than quietly granting.
+        return { allowed: false, via: 'stripe', detail: 'error:' + String(e && e.message || e).slice(0, 40) };
+    }
+}
+
+async function isSubscribed(email: string): Promise<boolean> {
+    return (await subscriptionSource(email)).allowed;
 }
 /** Returns null when the call may proceed, or a payload to send with 402 when it may not. */
-function freeGate(req: any, metric: 'ai' | 'offtarget'): any | null {
+async function freeGate(req: any, metric: 'design' | 'offtarget'): Promise<any | null> {
     const email = freeUserKey(req);
     if (!email) return null;                 // unidentified: not metered here
-    if (isSubscribed(email)) return null;    // subscribers are unlimited
+    if (await isSubscribed(email)) return null;    // subscribers are unlimited
     const used = freeUsedFor(email);
     if ((used as any)[metric] >= FREE_LIMIT) {
         return {
@@ -6357,8 +6505,8 @@ function freeGate(req: any, metric: 'ai' | 'offtarget'): any | null {
             used: (used as any)[metric],
             limit: FREE_LIMIT,
             resetsOn: periodResetsOn(),
-            message: (metric === 'ai'
-                ? 'You have used all ' + FREE_LIMIT + ' free AI requests this month.'
+            message: (metric === 'design'
+                ? 'You have used all ' + FREE_LIMIT + ' free designs this month.'
                 : 'You have used all ' + FREE_LIMIT + ' free off-target searches this month.')
                 + ' Your allowance resets on ' + periodResetsOn() + ' — or subscribe for unlimited use.'
         };
@@ -6366,24 +6514,76 @@ function freeGate(req: any, metric: 'ai' | 'offtarget'): any | null {
     const all = loadFreeUsage();
     const period = currentPeriod();
     // Roll the row over on the first call of a new month rather than accumulating.
-    if (!all[email] || all[email].period !== period) all[email] = { period, ai: 0, offtarget: 0 };
+    if (!all[email] || all[email].period !== period) all[email] = { period, design: 0, offtarget: 0 } as any;
     (all[email] as any)[metric] += 1;
     saveFreeUsage();
     return null;
 }
 
 // What the client shows as "N of 5 used" and uses to decide whether to offer the upgrade.
-app.get('/free-quota', (req, res) => {
+// Newspaper headlines for "The Baja Times" (the News button in the app toolbar).
+//
+// The same list py/bio/get-news.py serves to lionscript: BIG_DATA/news.json, with the same
+// defaults when the file has not been written yet. Exposed as a plain route because the shell
+// renders the newspaper itself and cannot run a python module to get two strings.
+app.get('/news-headlines', (req: any, res: any) => {
+    const DEFAULT = [
+        'Next week patents from 2020-2026 will be installed',
+        'Sept 29 release of liver RNASeq data',
+    ];
+    try {
+        const bd = process.env.BIGDATA || process.env.BIG_DATA
+            || path.join(os.homedir(), 'baja-bd');
+        const file = path.join(bd, 'news.json');
+        if (fs.existsSync(file)) {
+            const raw = JSON.parse(fs.readFileSync(file, 'utf-8'));
+            const items = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.messages) ? raw.messages : null);
+            if (items && items.length) {
+                return res.json({ items: items.map((x: any) => '' + x).filter((x: string) => x.trim()) });
+            }
+        }
+    } catch (e) {
+        // Fall through to the defaults: an unreadable file should not blank the paper.
+        console.warn('news-headlines: could not read news.json', e);
+    }
+    return res.json({ items: DEFAULT });
+});
+
+// One line per check, so the periodic polling is visible in the log:
+//   journalctl -u baja-server -f | grep '\[subscription\]'
+// The client polls every 20s per open tab, so this is deliberately ONE compact line rather
+// than a block -- enough to see who is being checked, what the answer was and what allowance
+// is left, without burying the rest of the log.
+function __logSubscriptionCheck(source: string, email: string, subscribed: boolean, extra?: string): void {
+    try {
+        console.log('[subscription] ' + new Date().toISOString()
+            + ' ' + source
+            + ' user=' + (email || '(anonymous)')
+            + ' subscribed=' + (subscribed ? 'YES' : 'no')
+            + (extra ? (' ' + extra) : ''));
+    } catch (e) { }
+}
+
+app.get('/free-quota', async (req, res) => {
     try {
         const email = freeUserKey(req);
-        const subscribed = isSubscribed(email);
+        const src = await subscriptionSource(email);
+        const subscribed = src.allowed;
         const used = freeUsedFor(email);
+        __logSubscriptionCheck('free-quota', email, subscribed,
+            'via=' + src.via + '(' + src.detail + ')'
+            + ' designs=' + used.design + '/' + FREE_LIMIT + ' offtarget=' + used.offtarget + '/' + FREE_LIMIT
+            + ' period=' + currentPeriod());
         return res.json({
             user: email, subscribed, limit: FREE_LIMIT,
             period: currentPeriod(), resetsOn: periodResetsOn(),
-            ai: used.ai, offtarget: used.offtarget,
-            aiRemaining: subscribed ? -1 : Math.max(0, FREE_LIMIT - used.ai),
-            offtargetRemaining: subscribed ? -1 : Math.max(0, FREE_LIMIT - used.offtarget)
+            design: used.design, offtarget: used.offtarget,
+            designRemaining: subscribed ? -1 : Math.max(0, FREE_LIMIT - used.design),
+            offtargetRemaining: subscribed ? -1 : Math.max(0, FREE_LIMIT - used.offtarget),
+            // Old names, kept for one release so a cached client mid-deploy still reads a
+            // sensible number instead of undefined.
+            ai: used.design,
+            aiRemaining: subscribed ? -1 : Math.max(0, FREE_LIMIT - used.design)
         });
     } catch (e: any) {
         return res.json({ error: String(e && e.message || e), limit: FREE_LIMIT });
@@ -8246,8 +8446,8 @@ const ppath = async (req: {
 }, res: any) => {
     // Same free-tier gate as the POST bridge: the AI tools are reachable both ways.
     try {
-        if (isAiScript(req.path)) {
-            const gate = freeGate(req, 'ai');
+        if (isDesignScript(req.path)) {
+            const gate = await freeGate(req, 'design');
             if (gate) return res.status(402).json(gate);
         }
     } catch (e) { }
@@ -8314,9 +8514,12 @@ const ppath = async (req: {
             SENDER_USER_ID: env.SENDER_USER_ID,
         });
 
+        // Registered so /py-cancel can kill it. The user scopes the cancel; it comes from the
+        // query when the client sends one and is simply absent otherwise.
         const pythonProcess = await spawnPythonGated(
             ["-u", pythonScriptPath, ...args],
-            { env }
+            { env },
+            { script: '' + (req.path || ''), user: (() => { try { const q: any = (req as any).query || {}; return '' + (q.user || q.email || ''); } catch (e) { return ''; } })() }
         );
 
         const outputFileStream = fs.createWriteStream(filePath, { flags: 'a' });
@@ -8350,8 +8553,8 @@ const post_ppath = async (req: { path: any; body: any; headers: { [x: string]: a
     // Free tier: 5 Anthropic-backed runs, then subscribe. Only the scripts in AI_METERED
     // count — every other python tool stays unmetered.
     try {
-        if (isAiScript(path)) {
-            const gate = freeGate(req, 'ai');
+        if (isDesignScript(path)) {
+            const gate = await freeGate(req, 'design');
             if (gate) return res.status(402).json(gate);
         }
     } catch (e) { /* never block on a metering failure */ }
@@ -8466,9 +8669,11 @@ const post_ppath = async (req: { path: any; body: any; headers: { [x: string]: a
         BIGDATA_LOCK_TTL_SEC: env.BIGDATA_LOCK_TTL_SEC,
     });
 
+    // Same registration as the GET bridge above.
     const pythonProcess = await spawnPythonGated(
         ["-u", pythonScriptPath, ...args],
-        { env }
+        { env },
+        { script: '' + ((req as any).path || ''), user: (() => { try { const b: any = (req as any).body || {}; return '' + (b.user || b.email || ''); } catch (e) { return ''; } })() }
     );
 
     const outputFileStream = fs.createWriteStream(filePath.toString(), { flags: 'a' });
@@ -8601,57 +8806,9 @@ app.get("/api/health", (_req, res) => {
 
 // })
 
-// app.post('/paypal/ipn', (req, res) => {
-//     // verify the IPN message with PayPal
-//     const ipn_url = 'https://www.sandbox.paypal.com/cgi-bin/webscr';
-//     const body = `cmd=_notify-validate&${req.body}`;
-//     request.post(ipn_url, { body }, (error, response, body) => {
-//       if (error || body !== 'VERIFIED') {
-//         console.error(error || 'Invalid response from PayPal');
-//         return res.sendStatus(400);
-//       }
-
-//       // parse the IPN message and extract the relevant informatione
-//       const txn_id = req.body.txn_id;
-//       const item_id = req.body.item_number;
-
-//       // update your database or take other action based on the IPN message
-//       console.log(`Payment received: transaction ID ${txn_id}, item ID ${item_id}`);
-//       // ...
-
-//       res.sendStatus(200);
-//     });
-//   });
-
-
-
-// var create_payment_json = {
-//     "intent": "sale",
-//     "payer": {
-//         "payment_method": "paypal"
-//     },
-//     "redirect_urls": {
-//         "return_url": "http://localhost:3000/success",
-//         "cancel_url": "http://localhost:3000/cancel"
-//     },
-//     "transactions": [{
-//         "amount": {
-//             "currency": "USD",
-//             "total": "10.00"
-//         },
-//         "description": "My Awesome Payment"
-//     }]
-// };
-
-// paypal.payment.create(create_payment_json, function (error, payment) {
-//     if (error) {
-//         console.log(error);
-//     } else {
-//         console.log(payment.id);
-//     }
-// });
-
-
+// The PayPal IPN handler and the PayPal payment-creation sample lived here, both commented
+// out. Payments and entitlement are Stripe-only now, so the dead blocks are gone rather
+// than left behind as a second, half-present payment path.
 
 function checkFileExists(filePath: fs.PathLike) {
     try {

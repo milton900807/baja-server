@@ -181,6 +181,43 @@ if want_be; then
   c "Ensuring exec venv (/opt/venv) has wheels + local libs (ion/bajasplice/bajaclip/djprimer/bajair)…"
   on_remote "PY=/opt/venv/bin/python3; sudo \$PY -m pip install --no-input -r '$REMOTE_API/deploy/venv-requirements.txt'; for lib in ion-lib bajasplice-lib bajaclip-lib djprimer-lib bajair-lib; do [ -d '$REMOTE_APPS/py/'\$lib ] && sudo \$PY -m pip install --no-input --no-deps -e '$REMOTE_APPS/py/'\$lib; done" \
     && ok "exec venv ready" || printf '\033[1;33m! exec venv setup had issues (non-fatal)\033[0m\n'
+
+  # BajaIR / BajaSplice reference data. score_gene() needs a genome FASTA and a GENCODE gene
+  # index; without them every intron-retention call fails with "genome_fasta is not configured",
+  # which is invisible until a user clicks the menu item. Built ONCE and then skipped, into
+  # reference_data (synced without --delete) rather than under $REMOTE_APPS, which IS deleted --
+  # the index the library bundles inside its own package directory would not survive a deploy.
+  c "Ensuring BajaSplice/BajaIR reference index…"
+  on_remote "set -e
+    ROOT='$REMOTE_DATA/bajasplice'
+    IDX=\"\$ROOT/data/processed/genes.sqlite\"
+    GTF=\"\$ROOT/data/raw/gencode.v46.basic.annotation.gtf.gz\"
+    FA=/opt/baja-apps/data/genome/GRCh38.primary_assembly.genome.fa
+    if [ -s \"\$IDX\" ] && [ -s ~/.config/bajasplice/config.json ]; then
+      echo 'gene index already present'; exit 0
+    fi
+    if [ ! -s \"\$FA\" ]; then echo 'no GRCh38 fasta yet — skipping index build'; exit 0; fi
+    sudo mkdir -p \"\$ROOT/data/raw\" \"\$ROOT/data/interim\" \"\$ROOT/data/processed\"
+    sudo chown -R ubuntu:ubuntu \"\$ROOT\"
+    # v46 to match the GFF3 the tracks themselves are drawn from, so intron
+    # coordinates line up with what is on screen.
+    [ -s \"\$GTF\" ] || curl -fsSL -o \"\$GTF\" https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_46/gencode.v46.basic.annotation.gtf.gz
+    /opt/venv/bin/python3 - <<'PYEOF'
+from bajasplice.config import configure
+from bajasplice.prepare.gencode import parse_exons
+from bajasplice.index import build_index, resolve_index
+import os
+root = os.path.expanduser('$REMOTE_DATA/bajasplice')
+p = configure(root=root,
+              genome_fasta='/opt/baja-apps/data/genome/GRCh38.primary_assembly.genome.fa',
+              gencode_gtf=root + '/data/raw/gencode.v46.basic.annotation.gtf.gz',
+              save=True).ensure()
+if not (p.interim / 'exons.tsv').exists():
+    print('exons:', parse_exons(p.gencode_gtf))
+print('index:', build_index())
+print('resolves to:', resolve_index())
+PYEOF" \
+    && ok "BajaSplice/BajaIR index ready" || printf '\033[1;33m! BajaIR index build had issues (intron retention will not run)\033[0m\n'
 fi
 
 # ---- 5. data resources (default ON) ----------------------------------------
