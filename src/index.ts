@@ -6280,10 +6280,24 @@ const SHARE_ALIAS_FILE = path.join(userData, 'share-aliases.json');
 // would mean nothing. Keyed by the signed-in email: production runs auth = 'b2c', so every
 // user (free included) has an identity to meter against.
 // ---------------------------------------------------------------------------------------
-const FREE_LIMIT = 5;
+const FREE_LIMIT = 5;                       // per calendar month, per metric
 const FREE_USAGE_FILE = path.join(userData, 'free-usage.json');
-type FreeUsage = { [email: string]: { ai: number; offtarget: number } };
+type FreeUsage = { [email: string]: { period?: string; ai: number; offtarget: number } };
 let __freeUsage: FreeUsage | null = null;
+
+// Allowance is monthly. The period is stored ON the user's row and the counts read as zero
+// once it no longer matches, so the reset needs no cron job and the file keeps exactly one
+// row per user instead of growing a new one every month. UTC, so the rollover happens at the
+// same instant regardless of where the server runs or how its clock is set.
+function currentPeriod(): string {
+    const d = new Date();
+    return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0');
+}
+// First day of next month, UTC — so "come back later" can carry an actual date.
+function periodResetsOn(): string {
+    const d = new Date();
+    return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1)).toISOString().slice(0, 10);
+}
 
 function loadFreeUsage(): FreeUsage {
     if (__freeUsage) return __freeUsage;
@@ -6304,7 +6318,10 @@ function freeUserKey(req: any): string {
 }
 function freeUsedFor(email: string): { ai: number; offtarget: number } {
     const all = loadFreeUsage();
-    return all[email] || { ai: 0, offtarget: 0 };
+    const rec = all[email];
+    // A row from a previous month — or a pre-monthly row with no period — reads as unused.
+    if (!rec || rec.period !== currentPeriod()) return { ai: 0, offtarget: 0 };
+    return { ai: rec.ai || 0, offtarget: rec.offtarget || 0 };
 }
 // The python tools that spend Anthropic credit. Matched on the script path so a new AI tool
 // has to be added here deliberately rather than being metered (or missed) by accident.
@@ -6336,16 +6353,20 @@ function freeGate(req: any, metric: 'ai' | 'offtarget'): any | null {
     if ((used as any)[metric] >= FREE_LIMIT) {
         return {
             error: 'free-limit',
-            metric: metric,
+            metric,
             used: (used as any)[metric],
             limit: FREE_LIMIT,
-            message: metric === 'ai'
-                ? 'You have used all ' + FREE_LIMIT + ' free AI requests. Subscribe to continue.'
-                : 'You have used all ' + FREE_LIMIT + ' free off-target searches. Subscribe to continue.'
+            resetsOn: periodResetsOn(),
+            message: (metric === 'ai'
+                ? 'You have used all ' + FREE_LIMIT + ' free AI requests this month.'
+                : 'You have used all ' + FREE_LIMIT + ' free off-target searches this month.')
+                + ' Your allowance resets on ' + periodResetsOn() + ' — or subscribe for unlimited use.'
         };
     }
     const all = loadFreeUsage();
-    if (!all[email]) all[email] = { ai: 0, offtarget: 0 };
+    const period = currentPeriod();
+    // Roll the row over on the first call of a new month rather than accumulating.
+    if (!all[email] || all[email].period !== period) all[email] = { period, ai: 0, offtarget: 0 };
     (all[email] as any)[metric] += 1;
     saveFreeUsage();
     return null;
@@ -6358,7 +6379,8 @@ app.get('/free-quota', (req, res) => {
         const subscribed = isSubscribed(email);
         const used = freeUsedFor(email);
         return res.json({
-            user: email, subscribed: subscribed, limit: FREE_LIMIT,
+            user: email, subscribed, limit: FREE_LIMIT,
+            period: currentPeriod(), resetsOn: periodResetsOn(),
             ai: used.ai, offtarget: used.offtarget,
             aiRemaining: subscribed ? -1 : Math.max(0, FREE_LIMIT - used.ai),
             offtargetRemaining: subscribed ? -1 : Math.max(0, FREE_LIMIT - used.offtarget)
