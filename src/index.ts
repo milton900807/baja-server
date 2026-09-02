@@ -4812,8 +4812,14 @@ app.get('/genomes', (_req: any, res: any) => {
     return res.json(out);
 });
 
+// A free user's single search covers at most this many compounds. The monthly count limits
+// how OFTEN they can screen; this limits how much any one screen can carry, so a run cannot
+// spend one search on a thousand oligos.
+const FREE_MAX_SEQS_PER_SEARCH = 10;
+
 app.post('/off-targets-file', async (req, res) => {
-    // Free tier: 5 off-target searches, then subscribe. No-op for subscribers.
+    // Free tier: a capped number of off-target searches a month, then subscribe. No-op for
+    // subscribers.
     try {
         const gate = await freeGate(req, 'offtarget');
         if (gate) return res.status(402).json(gate);
@@ -4826,7 +4832,22 @@ app.post('/off-targets-file', async (req, res) => {
     let strand = tm.strand;
     let genomes = '' + tm.genomes;
     let runMode = '' + tm.runMode;
-    const sequence = tm.sequences;
+    let sequence = tm.sequences;
+
+    // Trim a free user's batch to the per-search cap. Done here rather than in the client
+    // because the client is not the thing that should be enforcing it -- and it is done
+    // AFTER the gate, so a search that was refused for allowance is not also silently
+    // shortened. Subscribers are untouched; so is anyone the server cannot identify, who is
+    // not metered at all (see freeGate).
+    let __freeTrimmed = 0;
+    try {
+        const __email = freeUserKey(req);
+        if (__email && Array.isArray(sequence) && sequence.length > FREE_MAX_SEQS_PER_SEARCH
+            && !(await isSubscribed(__email))) {
+            __freeTrimmed = sequence.length - FREE_MAX_SEQS_PER_SEARCH;
+            sequence = sequence.slice(0, FREE_MAX_SEQS_PER_SEARCH);
+        }
+    } catch (e) { /* if the check fails, screen what was asked for */ }
     // let editDistance = req.query.editDistance;
     // let strand = req.query.strand;
     // let genomes = '' + req.query.genome;
@@ -6369,7 +6390,14 @@ const SHARE_ALIAS_FILE = path.join(userData, 'share-aliases.json');
 // would mean nothing. Keyed by the signed-in email: production runs auth = 'b2c', so every
 // user (free included) has an identity to meter against.
 // ---------------------------------------------------------------------------------------
-const FREE_LIMIT = 5;                       // per calendar month, per metric
+// Per calendar month, PER METRIC. The two are not the same size: a design is a considered
+// act a free user does a handful of times, while off-target screening is the check you run
+// against every candidate, so a cap that made sense for one made the other useless.
+const FREE_LIMITS: { design: number; offtarget: number } = { design: 5, offtarget: 10 };
+const freeLimitFor = (metric: 'design' | 'offtarget'): number => FREE_LIMITS[metric];
+// The single number the client shows when it has no metric in hand. Kept as the smaller of
+// the two so nothing quotes an allowance larger than it has.
+const FREE_LIMIT = FREE_LIMITS.design;
 const FREE_USAGE_FILE = path.join(userData, 'free-usage.json');
 type FreeUsage = { [email: string]: { period?: string; ai: number; offtarget: number } };
 let __freeUsage: FreeUsage | null = null;
@@ -6498,18 +6526,18 @@ async function freeGate(req: any, metric: 'design' | 'offtarget'): Promise<any |
     if (!email) return null;                 // unidentified: not metered here
     if (await isSubscribed(email)) return null;    // subscribers are unlimited
     const used = freeUsedFor(email);
-    if ((used as any)[metric] >= FREE_LIMIT) {
+    if ((used as any)[metric] >= freeLimitFor(metric)) {
         return {
             error: 'free-limit',
             metric,
             used: (used as any)[metric],
-            limit: FREE_LIMIT,
+            limit: freeLimitFor(metric),
             resetsOn: periodResetsOn(),
             // The off-target line is deliberately short and light: it is shown on the canvas
             // mid-run, where a sentence about allowances and reset dates reads as a failure.
             // resetsOn is still in the payload for anything that wants to spell it out.
             message: (metric === 'design'
-                ? 'You have used all ' + FREE_LIMIT + ' free designs this month.'
+                ? 'You have used all ' + freeLimitFor('design') + ' free designs this month.'
                 + ' Your allowance resets on ' + periodResetsOn() + ' — or subscribe for unlimited use.'
                 : 'No more free GPU time.  ;-)')
         };
@@ -6575,14 +6603,19 @@ app.get('/free-quota', async (req, res) => {
         const used = freeUsedFor(email);
         __logSubscriptionCheck('free-quota', email, subscribed,
             'via=' + src.via + '(' + src.detail + ')'
-            + ' designs=' + used.design + '/' + FREE_LIMIT + ' offtarget=' + used.offtarget + '/' + FREE_LIMIT
+            + ' designs=' + used.design + '/' + FREE_LIMITS.design
+            + ' offtarget=' + used.offtarget + '/' + FREE_LIMITS.offtarget
             + ' period=' + currentPeriod());
         return res.json({
+            // `limit` is the legacy single figure; designLimit / offtargetLimit are the real
+            // ones. A client that only knows `limit` shows the design allowance, which is the
+            // smaller, so it can understate what a user has but never overstate it.
             user: email, subscribed, limit: FREE_LIMIT,
+            designLimit: FREE_LIMITS.design, offtargetLimit: FREE_LIMITS.offtarget,
             period: currentPeriod(), resetsOn: periodResetsOn(),
             design: used.design, offtarget: used.offtarget,
-            designRemaining: subscribed ? -1 : Math.max(0, FREE_LIMIT - used.design),
-            offtargetRemaining: subscribed ? -1 : Math.max(0, FREE_LIMIT - used.offtarget),
+            designRemaining: subscribed ? -1 : Math.max(0, FREE_LIMITS.design - used.design),
+            offtargetRemaining: subscribed ? -1 : Math.max(0, FREE_LIMITS.offtarget - used.offtarget),
             // Old names, kept for one release so a cached client mid-deploy still reads a
             // sensible number instead of undefined.
             ai: used.design,
