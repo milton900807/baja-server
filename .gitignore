@@ -14,3 +14,39 @@ dist/
 *.log
 local-server.log
 deploy/local-server.log
+
+# ---------------------------------------------------------------------------------------
+# Added after a `git add -A` swept 20MB of generated reference data and deploy/env-prod.js
+# into a commit. The push was rejected, so nothing escaped -- but the only thing standing
+# between that content and the remote was a server-side hook, which is not where this
+# should be decided.
+#
+# Everything below is either GENERATED (rebuildable from a download or a script) or
+# DEPLOYMENT-LOCAL (belongs to one machine). Nothing here is source.
+
+# Downloaded / built reference genomes and their indexes. Large, and reproducible from the
+# Ensembl and GENCODE URLs the loaders already carry. The handful of .gff3.gz files that are
+# already tracked stay tracked -- .gitignore does not untrack -- and are deliberately not
+# matched here, so adding another one on purpose still works.
+reference_data/ensembl_cache/
+reference_data/*.fa.gz
+reference_data/*.bgz
+reference_data/*.bgz.tbi
+reference_data/*.regionidx.tsv
+
+# The stray variant index a one-off run dropped at the repo root (00-common_all.vcf.gz.tbi).
+# Scoped to .vcf.* rather than a blanket /*.tbi: there is ALREADY a tracked .tbi at the root
+# (gencode.v46.basic.annotation.sorted.gff3.gz.tbi), and a rule that shadows a tracked file is
+# a trap for whoever next wonders why their change to it is or is not being seen.
+/*.vcf.gz
+/*.vcf.gz.tbi
+
+# Editor state: one developer's window layout, not the project's.
+.vscode/
+
+# The production client env. assets/env.js is EXCLUDED from the deploy rsync and maintained
+# by hand on the server (see deploy/deploy.sh), so this local copy is a working artefact of
+# one machine, and it carries tenant / client / redirect configuration that should be read
+# before it is ever published. If it should be versioned, that is a deliberate act:
+#   git add -f deploy/env-prod.js
+deploy/env-prod.js
