@@ -6327,10 +6327,65 @@ app.post('/get-script', async (req, res) => {
 // A version that changes whenever the server (re)starts — i.e. on every deploy.
 // The frontend fetches this once and stamps it onto module URLs (?v=…) so that a
 // deploy busts the browser cache, while within a version modules cache forever.
-const APPS_VERSION = String(Date.now());
+// The version every /script URL is cache-busted with, derived from the APPS THEMSELVES: the
+// newest mtime of any module the /script route can serve.
+//
+// It used to be String(Date.now()) evaluated once at startup, which made a process restart the
+// only way to invalidate a cached script. A versioned /script response is `immutable` for a
+// year, so in development editing a lionscript changed nothing you could see -- the API served
+// the new file and the browser never asked for it, because the version had not moved. In
+// production it worked only incidentally, because deploy.sh restarts the service; a change
+// that reached the server any other way would have been invisible the same way.
+//
+// Recomputed at most every APPS_VERSION_TTL_MS. The walk is around 1,300 files and a few
+// milliseconds, but a stat storm per request, for a value that only changes when a human saves
+// a file, is still the wrong shape.
+const APPS_VERSION_TTL_MS = 10_000;
+// Used when the walk finds nothing -- a missing or unreadable apps dir. Falling back to the
+// old boot-time behaviour keeps the cache correct (a restart still busts it) rather than
+// emitting a constant, which would pin every client forever.
+const APPS_VERSION_FALLBACK = String(Date.now());
+// Skipped because /script cannot serve from them and they are where the bulk lives:
+// reference_data and data hold genomes and BIG_DATA, and dotted dirs hold .git and caches.
+const APPS_SKIP_DIRS = new Set(['node_modules', 'reference_data', 'data', '__pycache__', 'cache', 'out']);
+let __appsVersion: { value: string; at: number } | null = null;
+
+function scanAppsMtime(dir: string, budget: { files: number }): number {
+    let newest = 0;
+    let entries: any[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return 0; }
+    for (const e of entries) {
+        if (budget.files <= 0) break;
+        if (e.isDirectory()) {
+            if (e.name.startsWith('.') || APPS_SKIP_DIRS.has(e.name)) continue;
+            newest = Math.max(newest, scanAppsMtime(path.join(dir, e.name), budget));
+        } else if (e.isFile() && (e.name.endsWith('.js') || e.name.endsWith('.json'))) {
+            budget.files--;
+            try { newest = Math.max(newest, fs.statSync(path.join(dir, e.name)).mtimeMs); } catch { }
+        }
+    }
+    return newest;
+}
+
+function getAppsVersion(): string {
+    const now = Date.now();
+    if (__appsVersion && now - __appsVersion.at < APPS_VERSION_TTL_MS) return __appsVersion.value;
+    let v = APPS_VERSION_FALLBACK;
+    try {
+        // Capped, so a tree that grows unexpectedly degrades to a bounded partial scan rather
+        // than making every refresh window expensive.
+        const newest = scanAppsMtime(wd, { files: 20000 });
+        if (newest > 0) v = String(Math.round(newest));
+    } catch { }
+    __appsVersion = { value: v, at: now };
+    return v;
+}
+
 app.get('/apps-version', (_req, res) => {
-    res.set('Cache-Control', 'public, max-age=15');
-    res.json({ version: APPS_VERSION });
+    // Short max-age: this is the value that tells a client whether its cached modules are still
+    // good, so it must not itself be cached for longer than it takes to change.
+    res.set('Cache-Control', 'public, max-age=5');
+    res.json({ version: getAppsVersion() });
 });
 
 // CACHEABLE module fetch (GET twin of POST /get-script). Same JSON shape, but the
