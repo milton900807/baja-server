@@ -3194,13 +3194,41 @@ app.post(['/stripe/create-checkout-session', '/api/stripe/create-checkout-sessio
         const back = returnPath || '/subscribe';
         const customer = await stripeCustomerFor(email, name);
 
+        // ---- 30-day trial, gene.clinic only -------------------------------------------
+        // The clinic entry point offers families a month before they are charged.
+        // oligodesigner.com is untouched and still bills on the day, so this is a new
+        // offer on a new door rather than a pricing change for existing customers.
+        //
+        // Decided from the ORIGIN the browser actually came from, not from a flag in the
+        // request body: a body field is something a caller can set, and this one is worth
+        // money. Origin is set by the browser and cannot be forged by page script.
+        //
+        // `appBase` is deliberately NOT trusted for this even though it is trusted for the
+        // return URL -- a wrong return URL sends someone to the wrong page, a wrong trial
+        // gives away a month.
+        const originHost = (() => {
+            try { return new URL(String(req.headers.origin || '')).hostname.toLowerCase(); }
+            catch (e) { return ''; }
+        })();
+        const isClinic = originHost === 'gene.clinic' || originHost.endsWith('.gene.clinic');
+        // Only a subscription can carry a trial; a one-time 'payment' checkout cannot, and
+        // asking Stripe for one there is an error rather than a no-op.
+        const trialDays = (isClinic && isRecurring) ? 30 : 0;
+
         const session = await stripeClient!.checkout.sessions.create({
             mode: isRecurring ? 'subscription' : 'payment',
             customer: customer.id,
             line_items: [{ price: resolvedPriceId, quantity: 1 }],
             allow_promotion_codes: true,
             client_reference_id: email,
-            metadata: { email, plan: isRecurring ? 'subscription' : 'early-access' },
+            ...(trialDays ? { subscription_data: { trial_period_days: trialDays } } : {}),
+            metadata: {
+                email,
+                plan: isRecurring ? 'subscription' : 'early-access',
+                // On the subscription itself, so a support question months later can be
+                // answered from the record rather than from memory.
+                ...(trialDays ? { entry: 'gene.clinic', trial_days: String(trialDays) } : {}),
+            },
             ...(isRecurring ? {} : { payment_intent_data: { metadata: { email, plan: 'early-access' } } }),
             success_url: `${base}${back}?status=success&session_id={CHECKOUT_SESSION_ID}`,
             cancel_url: `${base}${back}?status=cancel`,
