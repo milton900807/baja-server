@@ -6417,15 +6417,24 @@ const APPS_VERSION_FALLBACK = String(Date.now());
 const APPS_SKIP_DIRS = new Set(['node_modules', 'reference_data', 'data', '__pycache__', 'cache', 'out']);
 let __appsVersion: { value: string; at: number } | null = null;
 
-function scanAppsMtime(dir: string, budget: { files: number }): number {
+// 'data' and 'reference_data' are skipped only at the TOP of the apps tree, where they hold
+// genomes and BIG_DATA. Nested ones -- baja/data, baja/plate/data, baja/manchester/menu/data --
+// hold lionscript modules (load-variants.js, data-resources-library.js, ...). Skipping them at
+// every depth meant an edit there never moved the version, so browsers kept the module they had
+// cached as immutable and a fix "did not deploy" until an unrelated file changed elsewhere.
+// deploy.sh already special-cases the same directories for the same reason.
+const APPS_TOP_ONLY_SKIP = new Set(['data', 'reference_data']);
+function scanAppsMtime(dir: string, budget: { files: number }, depth = 0): number {
     let newest = 0;
     let entries: any[];
     try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return 0; }
     for (const e of entries) {
         if (budget.files <= 0) break;
         if (e.isDirectory()) {
-            if (e.name.startsWith('.') || APPS_SKIP_DIRS.has(e.name)) continue;
-            newest = Math.max(newest, scanAppsMtime(path.join(dir, e.name), budget));
+            if (e.name.startsWith('.')) continue;
+            if (APPS_TOP_ONLY_SKIP.has(e.name)) { if (depth === 0) continue; }
+            else if (APPS_SKIP_DIRS.has(e.name)) continue;
+            newest = Math.max(newest, scanAppsMtime(path.join(dir, e.name), budget, depth + 1));
         } else if (e.isFile() && (e.name.endsWith('.js') || e.name.endsWith('.json'))) {
             budget.files--;
             try { newest = Math.max(newest, fs.statSync(path.join(dir, e.name)).mtimeMs); } catch { }
@@ -8836,8 +8845,13 @@ const post_ppath = async (req: { path: any; body: any; headers: { [x: string]: a
 
     const outputFileStream = fs.createWriteStream(filePath.toString(), { flags: 'a' });
 
+    // Write stdout chunks exactly as they arrive. A pipe delivers stdout in ~64 KB chunks,
+    // and appending a newline to each one cut every longer line -- an IONWORKS:RESOLUTION
+    // payload past 64 KB (a ClinVar region query, a long profile) -- into pieces the client
+    // could not parse, so the tool reported "no results" on exactly the biggest answers.
+    // Python's own print() already ends each line.
     pythonProcess.stdout.on('data', (data: Buffer) => {
-        outputFileStream.write(data.toString() + '\n');
+        outputFileStream.write(data);
     });
 
     pythonProcess.stderr.on('data', (data: Buffer) => {
