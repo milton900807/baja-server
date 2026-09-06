@@ -339,13 +339,23 @@ function parseVcfLines(buf: string, db: string, limit: number): any[] {
         const info = parseVcfInfo(f[7]);
         let clinsig: string[] = [];
         if (info.CLNSIG) clinsig = info.CLNSIG.replace(/_/g, ' ').split(/[|,/]/).map((s) => s.trim()).filter(Boolean);
+        // CLNDN is the disease each submission was filed against, and it is the only field
+        // that can answer "the variants relevant to coronary heart disease" rather than
+        // "every variant in this window". It was being dropped. "not provided" / "not
+        // specified" are ClinVar's placeholders for no answer, not conditions.
+        let conditions: string[] = [];
+        if (info.CLNDN) {
+            conditions = info.CLNDN.replace(/_/g, ' ').split('|')
+                .map((s) => s.trim().replace(/,$/, ''))
+                .filter((s) => s && !/^not (provided|specified)$/i.test(s));
+        }
         const gene = (info.GENEINFO || '').split(':')[0] || null;
         const rid = info.RS ? 'rs' + info.RS : (f[2] && f[2] !== '.' ? f[2] : (db || 'variant'));
         for (const alt of String(f[4] || '').split(',')) {
             if (alt.length > MAX_VARIANT_ALLELE) continue;   // structural alt allele
             out.push({
                 id: rid, chr: String(f[0]).replace(/^chr/, ''), start: pos, end: pos + Math.max(0, ref.length - 1),
-                strand: 1, ref, alt, alleles: [ref, alt], clinsig,
+                strand: 1, ref, alt, alleles: [ref, alt], clinsig, conditions,
                 consequence: info.MC ? String(info.MC).split('|').pop() : null,
                 source: db === 'clinvar' ? 'ClinVar' : db, af: null, gene,
             });
