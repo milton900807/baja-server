@@ -147,7 +147,10 @@ if want_be; then
   fi
 
   c "Syncing lionscript library → $REMOTE_APPS"
-  "${RSYNC[@]}" --delete --exclude '.git' --exclude 'node_modules' "${APPS_EXTRA_EXCL[@]}" \
+  # '*.egg-info' is written on the server by the editable installs below (sudo pip -e), is
+  # root-owned, and must survive: deleting it would break those installs, and rsync cannot
+  # delete it anyway (exit 23, which aborts the deploy before the restart).
+  "${RSYNC[@]}" --delete --exclude '.git' --exclude 'node_modules' --exclude '*.egg-info' "${APPS_EXTRA_EXCL[@]}" \
     "$APPS_SRC/" "$SERVER:$REMOTE_APPS/"
 
   # Some lionscript modules live under data/ dirs (e.g. baja/data/*.js, baja/plate/data,

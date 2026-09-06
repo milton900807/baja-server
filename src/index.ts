@@ -129,7 +129,7 @@ interface TranscriptPayload {
     // True while this species' local reference is still downloading/indexing,
     // so the client can tell the user the data came from the remote service.
     referencesLoading?: boolean;
-    sequenceSource?: "cache" | "local" | "ensembl" | "none" | "premrna";
+    sequenceSource?: "cache" | "local" | "ensembl" | "none" | "premrna" | "ensembl-genomic";
     annotationSource?: "local" | "ensembl" | "none";
 }
 
@@ -931,7 +931,7 @@ interface TranscriptPayload {
     // True while this species' local reference is still downloading/indexing,
     // so the client can tell the user the data came from the remote service.
     referencesLoading?: boolean;
-    sequenceSource?: "cache" | "local" | "ensembl" | "none" | "premrna";
+    sequenceSource?: "cache" | "local" | "ensembl" | "none" | "premrna" | "ensembl-genomic";
     annotationSource?: "local" | "ensembl" | "none";
 }
 
@@ -1821,6 +1821,24 @@ async function ensemblFetch(
     throw err;
 }
 
+// The UNSPLICED sequence of a transcript's genomic span, from Ensembl REST. Used when the
+// local pre-mRNA path cannot serve a transcript -- an alt-contig transcript such as SMN2-231
+// on HSCHR5_1_CTG1_1, which is in neither the primary-assembly FASTA nor the region index.
+// Ensembl returns it in TRANSCRIPT orientation (reverse-complemented for a minus-strand
+// transcript); it is flipped back here so the payload holds the plus-strand slice exactly
+// like the FASTA pre-mRNA, which the client indexes by genomic offset.
+async function fetchEnsemblGenomicSequence(
+    transcriptId: string,
+    strand: string | null,
+    baseUrl: string = ENSEMBL_REST_BASE
+): Promise<string> {
+    const strippedId = stripDecimal(transcriptId);
+    const url = `${baseUrl}/sequence/id/${encodeURIComponent(strippedId)}?type=genomic`;
+    const response = await ensemblFetch(url, { Accept: "text/plain" });
+    const seq = (await response.text()).trim();
+    return (strand === "-" || strand === "-1") ? reverseComplement(seq) : seq;
+}
+
 async function fetchEnsemblSequence(
     transcriptId: string,
     baseUrl: string = ENSEMBL_REST_BASE
@@ -2166,7 +2184,10 @@ async function getTranscriptSequenceAndAnnotations(
     // remote copy. Warms the in-memory cache on a hit.
     if (!referencesLoading) {
         const diskCached = readTranscriptDiskCache(resultKey);
-        if (diskCached) {
+        // A cached payload whose sequence is the spliced cDNA (sequenceSource "ensembl")
+        // was written before the unspliced Ensembl fallback existed; re-resolve it so the
+        // track gets its genomic span, and the rewrite below replaces the stale file.
+        if (diskCached && diskCached.sequenceSource !== "ensembl") {
             transcriptResultCache[resultKey] = diskCached;
             return { ...diskCached, species, referencesLoading };
         }
@@ -2192,13 +2213,30 @@ async function getTranscriptSequenceAndAnnotations(
     // so the client can still build the track; the sequence can be filled in
     // on a later attempt.
     let rawSequence = "";
-    let sequenceSource: "cache" | "local" | "ensembl" | "none" | "premrna" = "none";
+    let sequenceSource: "cache" | "local" | "ensembl" | "none" | "premrna" | "ensembl-genomic" = "none";
     // Prefer the unspliced PRE-mRNA (genomic span) — a transcript id loads its
     // primary/unspliced sequence. Falls back to the cDNA when no genome/region.
     const premrnaSeq = await getPremrnaSequence(species, transcriptId);
+    // Not in the local genome/index (alt-contig or non-basic transcript): still prefer the
+    // unspliced span, from Ensembl, over a cDNA. A spliced sequence in a genomic frame
+    // breaks every per-position tool (splice sites, RBP scan) and the coordinates of every
+    // exon past the first, so the cDNA is the last resort, not the first fallback.
+    let ensemblGenomicSeq = "";
+    if (!premrnaSeq && annotations.length > 0) {
+        try {
+            ensemblGenomicSeq = await fetchEnsemblGenomicSequence(
+                transcriptId, annotations[0]?.strand ?? null, baseUrl);
+        } catch (genErr: any) {
+            console.warn(`Ensembl genomic sequence unavailable for ${transcriptId}:`, genErr?.message || genErr);
+            ensemblGenomicSeq = "";
+        }
+    }
     if (premrnaSeq) {
         rawSequence = premrnaSeq;
         sequenceSource = "premrna";
+    } else if (ensemblGenomicSeq) {
+        rawSequence = ensemblGenomicSeq;
+        sequenceSource = "ensembl-genomic";
     } else if (sequenceCache[resultKey]) {
         rawSequence = sequenceCache[resultKey];
         sequenceSource = "cache";
@@ -2236,7 +2274,7 @@ async function getTranscriptSequenceAndAnnotations(
 
     // Pre-mRNA is the + strand genomic slice and must stay in genomic orientation
     // (the track indexes it by genomic offset); only spliced cDNA is flipped.
-    if (negativeStrand && sequenceSource !== "premrna") {
+    if (negativeStrand && sequenceSource !== "premrna" && sequenceSource !== "ensembl-genomic") {
         sequence = useReverseComplement
             ? reverseComplement(sequence)
             : reverseSequence(sequence);
@@ -2271,7 +2309,8 @@ async function getTranscriptSequenceAndAnnotations(
         // Ensembl/EBI REST site (not available locally) — so future requests, even after
         // a restart, skip the remote site. Local transcripts are already fast and are
         // left out to avoid pinning them to a snapshot.
-        if (payload.annotationSource === "ensembl" || payload.sequenceSource === "ensembl") {
+        if (payload.annotationSource === "ensembl" || payload.sequenceSource === "ensembl"
+            || payload.sequenceSource === "ensembl-genomic") {
             writeTranscriptDiskCache(resultKey, payload);
         }
     }

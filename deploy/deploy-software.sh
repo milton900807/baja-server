@@ -104,7 +104,10 @@ if want_be; then
   "${RSYNC[@]}" --delete "${DATA_CONFIG_EXCLUDES[@]}" "$SRV_DIR/" "$SERVER:$REMOTE_API/"
 
   c "Syncing lionscript code → $REMOTE_APPS  (data & config preserved)"
-  "${RSYNC[@]}" --delete --exclude '.git' --exclude 'node_modules' \
+  # '*.egg-info' is written on the server by the venv's editable installs (sudo pip -e),
+  # is root-owned, and must survive: deleting it would break those installs, and rsync
+  # cannot delete it anyway (exit 23, which aborts the deploy before the restart).
+  "${RSYNC[@]}" --delete --exclude '.git' --exclude 'node_modules' --exclude '*.egg-info' \
     --exclude 'data' --exclude 'config' "$APPS_DIR/" "$SERVER:$REMOTE_APPS/"
 
   # Lionscript modules that live under data/ dirs (e.g. baja/data/*.js) are code but get
