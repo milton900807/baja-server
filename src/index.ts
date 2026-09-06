@@ -337,6 +337,11 @@ function parseVcfLines(buf: string, db: string, limit: number): any[] {
         const ref = f[3];
         if (ref.length > MAX_VARIANT_ALLELE) continue;   // skip structural variants
         const info = parseVcfInfo(f[7]);
+        // EVERY ANNOTATION ON THE RECORD, not the four fields that happened to be read out
+        // of it. SnpIndel.setAnnotation() takes exactly this shape -- the INFO column split
+        // on ';' -- and the track's detail box, the ClinDN column and the saved file all
+        // read from it, so anything dropped here is gone from the interface as well.
+        const annotations = String(f[7] || '').split(';').filter(Boolean);
         let clinsig: string[] = [];
         if (info.CLNSIG) clinsig = info.CLNSIG.replace(/_/g, ' ').split(/[|,/]/).map((s) => s.trim()).filter(Boolean);
         // CLNDN is the disease each submission was filed against, and it is the only field
@@ -355,7 +360,7 @@ function parseVcfLines(buf: string, db: string, limit: number): any[] {
             if (alt.length > MAX_VARIANT_ALLELE) continue;   // structural alt allele
             out.push({
                 id: rid, chr: String(f[0]).replace(/^chr/, ''), start: pos, end: pos + Math.max(0, ref.length - 1),
-                strand: 1, ref, alt, alleles: [ref, alt], clinsig, conditions,
+                strand: 1, ref, alt, alleles: [ref, alt], clinsig, conditions, annotations,
                 consequence: info.MC ? String(info.MC).split('|').pop() : null,
                 source: db === 'clinvar' ? 'ClinVar' : db, af: null, gene,
             });
