@@ -124,6 +124,10 @@ interface TranscriptPayload {
     sequence: string;
     annotations: Annotation[];
     strand: string | null;
+    // Whether `sequence` was actually flipped, NOT whether the gene is on the minus strand.
+    // The premrna and ensembl-genomic sources ship the plus-strand genomic slice as it is,
+    // because the track indexes it by genomic offset -- so a minus-strand transcript from
+    // those has strand "-" and this false, and the reader must complement it itself.
     reversedForNegativeStrand: boolean;
     species?: string;
     // True while this species' local reference is still downloading/indexing,
@@ -941,6 +945,10 @@ interface TranscriptPayload {
     sequence: string;
     annotations: Annotation[];
     strand: string | null;
+    // Whether `sequence` was actually flipped, NOT whether the gene is on the minus strand.
+    // The premrna and ensembl-genomic sources ship the plus-strand genomic slice as it is,
+    // because the track indexes it by genomic offset -- so a minus-strand transcript from
+    // those has strand "-" and this false, and the reader must complement it itself.
     reversedForNegativeStrand: boolean;
     species?: string;
     // True while this species' local reference is still downloading/indexing,
@@ -2289,10 +2297,24 @@ async function getTranscriptSequenceAndAnnotations(
 
     // Pre-mRNA is the + strand genomic slice and must stay in genomic orientation
     // (the track indexes it by genomic offset); only spliced cDNA is flipped.
-    if (negativeStrand && sequenceSource !== "premrna" && sequenceSource !== "ensembl-genomic") {
+    const keepsGenomicOrientation =
+        sequenceSource === "premrna" || sequenceSource === "ensembl-genomic";
+
+    // THE FLAG REPORTS WHAT HAPPENED, NOT WHAT THE STRAND IS.
+    //
+    // It used to be set from negativeStrand alone, so it read true for every minus-strand
+    // transcript -- including the two sources just excluded from the flip, where the sequence
+    // that ships is still the plus-strand genomic slice. A client that believed it would read
+    // a minus-strand pre-mRNA in the wrong orientation and get a protein that is not one:
+    // H3C2's coding sequence taken as plus-strand text translates to MDGAKVCVLKEPYQVG...
+    // rather than histone H3. Nothing reads the flag today, which is the only reason this was
+    // latent rather than a bug someone had already hit.
+    let reversedForNegativeStrand = false;
+    if (negativeStrand && !keepsGenomicOrientation) {
         sequence = useReverseComplement
             ? reverseComplement(sequence)
             : reverseSequence(sequence);
+        reversedForNegativeStrand = true;
     }
 
     const payload: TranscriptPayload = {
@@ -2300,7 +2322,7 @@ async function getTranscriptSequenceAndAnnotations(
         sequence,
         annotations,
         strand,
-        reversedForNegativeStrand: negativeStrand,
+        reversedForNegativeStrand,
         species,
         referencesLoading,
         sequenceSource,
