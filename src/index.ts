@@ -139,7 +139,7 @@ interface TranscriptPayload {
 
 app.get(['/transcript/:transcriptId', '/api/ensembl/transcript/:transcriptId'], async (req, res) => {
     try {
-        const { transcriptId } = req.params;
+        let { transcriptId } = req.params;
         const prefix = (req.query.prefix as string) || ENSEMBL_REST_BASE;
         // Prefer an explicit species query param; otherwise infer it from the
         // transcript id prefix (ENST=human, ENSMUST=mouse, ENSRNOT=rat).
@@ -147,6 +147,8 @@ app.get(['/transcript/:transcriptId', '/api/ensembl/transcript/:transcriptId'], 
         const species = normalizeSpecies(
             requestedSpecies || speciesFromTranscriptId(transcriptId) || speciesByRegionIndex(transcriptId) || 'human'
         );
+        // A bare yeast gene name means its transcript (YAL069W -> YAL069W_mRNA).
+        if (species === 'yeast') transcriptId = resolveYeastTranscriptId(transcriptId);
         const useReverseComplement = req.query.reverseComplement === 'true';
 
         if (!transcriptId) {
@@ -585,7 +587,7 @@ app.get('/reference/install/:species', async (req: any, res: any) => {
     try {
         const raw = String(req.params.species || 'all').trim().toLowerCase();
         const targets = raw === 'all'
-            ? ['human', 'mouse', 'rat']
+            ? ['human', 'mouse', 'rat', 'yeast']
             : [normalizeSpecies(raw)];
 
         const report: any[] = [];
@@ -1005,9 +1007,17 @@ const speciesRegistry: SpeciesRegistry = {
         aliases: ["rattus_norvegicus", "rnorvegicus", "mratbn7", "rn7"],
     },
     yeast: {
+        // Ensembl R64-1-1 == SGD R64 == UCSC sacCer3. Transcript ids are the SGD
+        // systematic names with a type suffix (YAL069W_mRNA, snR19_snRNA), so nothing
+        // about them says "yeast" the way ENST says "human": see speciesFromTranscriptId.
         filePath: "./reference_data/yeast.annotation.gff3.gz",
         remoteUrl: "https://ftp.ensembl.org/pub/release-110/gff3/saccharomyces_cerevisiae/Saccharomyces_cerevisiae.R64-1-1.110.gff3.gz",
-        aliases: ["saccharomyces_cerevisiae", "s_cerevisiae", "scerevisiae"],
+        cdnaPath: "./reference_data/yeast.cdna.all.fa.gz",
+        cdnaUrl: `${ENSEMBL_FTP}/fasta/saccharomyces_cerevisiae/cdna/Saccharomyces_cerevisiae.R64-1-1.cdna.all.fa.gz`,
+        ncrnaPath: "./reference_data/yeast.ncrna.fa.gz",
+        ncrnaUrl: `${ENSEMBL_FTP}/fasta/saccharomyces_cerevisiae/ncrna/Saccharomyces_cerevisiae.R64-1-1.ncrna.fa.gz`,
+        aliases: ["saccharomyces_cerevisiae", "s_cerevisiae", "scerevisiae", "s. cerevisiae",
+            "cerevisiae", "saccer3", "saccer", "r64", "r64-1-1", "sgd", "budding yeast"],
     },
     dog: {
         filePath: "./reference_data/dog.annotation.gff3.gz",
@@ -1077,6 +1087,31 @@ function normalizeSpecies(species: string | null | undefined): string {
     return s;
 }
 
+// YEAST HAS NO PREFIX. Ensembl's S. cerevisiae ids are SGD's own: a systematic ORF name
+// (YAL069W, YBL100W-A, Q0010 in the mitochondrion) or a named RNA (snR19, tP(UGG)A) with
+// the transcript type hung on the end -- YAL069W_mRNA, snR19_snRNA -- and the transposable
+// elements carry no suffix at all (YPR158W-B). The shape is the tell. Mirrored in
+// lib/core.js isYeastTranscriptId.
+const YEAST_TRANSCRIPT_RE = /^(?:[A-Za-z0-9()'-]+_(?:mRNA|ncRNA|tRNA|rRNA|snRNA|snoRNA|transcript)|Y[A-P][LR]\d{3}[WC](?:-[A-Z])?|Q\d{4})$/;
+const YEAST_TRANSCRIPT_SUFFIXES = ["_mRNA", "_ncRNA", "_tRNA", "_snoRNA", "_rRNA", "_snRNA", ""];
+function isYeastTranscriptId(transcriptId: string): boolean {
+    return YEAST_TRANSCRIPT_RE.test(String(transcriptId || "").trim());
+}
+
+// A yeast GENE id stands in for its transcript. SGD names the transcript after the gene
+// (YAL069W -> YAL069W_mRNA), so a request for the bare systematic name -- which is what
+// people type, and what the karyotype's gene lookup returns -- is answered with the one
+// transcript that carries it, from the region index rather than from a guess.
+function resolveYeastTranscriptId(transcriptId: string): string {
+    const id = String(transcriptId || "").trim();
+    const idx = annotationRegionIndex["yeast"];
+    if (!idx || idx.has(id)) return id;
+    for (const suf of YEAST_TRANSCRIPT_SUFFIXES) {
+        if (suf && idx.has(id + suf)) return id + suf;
+    }
+    return id;
+}
+
 // Infer species from an Ensembl transcript stable id prefix.
 //   ENST… = human, ENSMUST… = mouse, ENSRNOT… = rat.
 function speciesFromTranscriptId(transcriptId: string): string | null {
@@ -1085,6 +1120,7 @@ function speciesFromTranscriptId(transcriptId: string): string | null {
     if (id.startsWith("ENSRNOT")) return "rat";
     if (id.startsWith("ENSCAFT")) return "dog";
     if (id.startsWith("ENST")) return "human";
+    if (isYeastTranscriptId(transcriptId)) return "yeast";
     return null;
 }
 
@@ -3098,6 +3134,17 @@ app.post(['/oidc/token', '/api/oidc/token'], async (req: any, res: any) => {
             params.forEach((v: string, k: string) => { json[k] = v; });
         }
         if (!r.ok || json.error) return res.status(r.ok ? 400 : r.status).json(json);
+        // One line per successful sign-in, parsed by deploy/login-alert.js. The email comes
+        // from the id_token when the provider issues one (Google, Apple); otherwise the
+        // watcher pairs the login with the user's next identified request.
+        try {
+            let who = '';
+            if (typeof json.id_token === 'string' && json.id_token.split('.').length === 3) {
+                const payload = JSON.parse(Buffer.from(json.id_token.split('.')[1], 'base64url').toString('utf8'));
+                who = String(payload.email || payload.preferred_username || payload.upn || payload.sub || '');
+            }
+            console.log(`[login] provider=${String(provider || '').toLowerCase()} user=${who || '(unknown)'}`);
+        } catch { }
         return res.json(json);
     } catch (e: any) {
         return res.status(500).json({ error: 'proxy_error', error_description: e?.message || String(e) });
@@ -4916,17 +4963,29 @@ app.get('/genomes', (_req: any, res: any) => {
     return res.json(out);
 });
 
-// A free user's single search covers at most this many compounds. The monthly count limits
-// how OFTEN they can screen; this limits how much any one screen can carry, so a run cannot
-// spend one search on a thousand oligos.
-const FREE_MAX_SEQS_PER_SEARCH = 10;
-
 app.post('/off-targets-file', async (req, res) => {
-    // Free tier: a capped number of off-target searches a month, then subscribe. No-op for
-    // subscribers.
+    // Free tier: a monthly allowance of COMPOUNDS SCREENED, charged per oligo in this
+    // request rather than one per request. No-op for subscribers.
+    //
+    // There is no longer a separate per-search cap. It existed so a single search could not
+    // spend a whole month's worth on one enormous run; charging by the compound makes that
+    // impossible on its own, and removes the odd result where screening three oligos cost
+    // the same as screening ten.
+    let __freeTrimmed = 0;
     try {
-        const gate = await freeGate(req, 'offtarget');
-        if (gate) return res.status(402).json(gate);
+        const __want = Array.isArray(req.body && req.body.sequences) ? req.body.sequences.length : 1;
+        const __charge = await freeCharge(req, 'offtarget', Math.max(1, __want));
+        if (__charge.gate) return res.status(402).json(__charge.gate);
+        // Asked for more than is left: screen what the allowance covers rather than refuse
+        // the lot. Only ever applies to a metered caller -- freeCharge reports the full
+        // amount for a subscriber and for anyone it cannot identify.
+        if (__charge.metered && Array.isArray(req.body.sequences)
+            && req.body.sequences.length > __charge.allowed) {
+            __freeTrimmed = req.body.sequences.length - __charge.allowed;
+            req.body.sequences = req.body.sequences.slice(0, __charge.allowed);
+            console.log('[off-targets] free allowance covered ' + __charge.allowed
+                + ' of ' + (__charge.allowed + __freeTrimmed) + ' compounds');
+        }
     } catch (e) { /* metering must never block a subscriber's search */ }
     const uuid = Math.floor(Date.now() / 1000);
     const inputfile = inputtemplate + uuid + '.json';
@@ -4936,22 +4995,10 @@ app.post('/off-targets-file', async (req, res) => {
     let strand = tm.strand;
     let genomes = '' + tm.genomes;
     let runMode = '' + tm.runMode;
-    let sequence = tm.sequences;
+    const sequence = tm.sequences;
 
-    // Trim a free user's batch to the per-search cap. Done here rather than in the client
-    // because the client is not the thing that should be enforcing it -- and it is done
-    // AFTER the gate, so a search that was refused for allowance is not also silently
-    // shortened. Subscribers are untouched; so is anyone the server cannot identify, who is
-    // not metered at all (see freeGate).
-    let __freeTrimmed = 0;
-    try {
-        const __email = freeUserKey(req);
-        if (__email && Array.isArray(sequence) && sequence.length > FREE_MAX_SEQS_PER_SEARCH
-            && !(await isSubscribed(__email))) {
-            __freeTrimmed = sequence.length - FREE_MAX_SEQS_PER_SEARCH;
-            sequence = sequence.slice(0, FREE_MAX_SEQS_PER_SEARCH);
-        }
-    } catch (e) { /* if the check fails, screen what was asked for */ }
+    // The trim, if any, already happened above when the allowance was charged -- `sequence`
+    // was read from the body after that, so it is the trimmed list.
     // let editDistance = req.query.editDistance;
     // let strand = req.query.strand;
     // let genomes = '' + req.query.genome;
@@ -6561,7 +6608,16 @@ const SHARE_ALIAS_FILE = path.join(userData, 'share-aliases.json');
 // Per calendar month, PER METRIC. The two are not the same size: a design is a considered
 // act a free user does a handful of times, while off-target screening is the check you run
 // against every candidate, so a cap that made sense for one made the other useless.
-const FREE_LIMITS: { design: number; offtarget: number } = { design: 5, offtarget: 10 };
+// WHAT THESE COUNT IS NOT THE SAME FOR BOTH.
+//
+//   design    one run of a designer, whatever it returns.
+//   offtarget one OLIGO screened. Not one search -- the meter charges per compound, so a
+//             search of three costs three and a search of thirty costs thirty.
+//
+// It used to be ten searches a month with each search capped at ten compounds, which came
+// to the same hundred by a route nobody could work out from the number they were shown. One
+// total, in the unit the user actually spends, replaces both.
+const FREE_LIMITS: { design: number; offtarget: number } = { design: 5, offtarget: 100 };
 const freeLimitFor = (metric: 'design' | 'offtarget'): number => FREE_LIMITS[metric];
 // The single number the client shows when it has no metric in hand. Kept as the smaller of
 // the two so nothing quotes an allowance larger than it has.
@@ -6689,34 +6745,61 @@ async function isSubscribed(email: string): Promise<boolean> {
     return (await subscriptionSource(email)).allowed;
 }
 /** Returns null when the call may proceed, or a payload to send with 402 when it may not. */
-async function freeGate(req: any, metric: 'design' | 'offtarget'): Promise<any | null> {
+// Charge `want` units against an allowance.
+//
+// Returns how many were actually affordable, and the 402 body when the answer is none. A
+// caller that asked for more than is left gets a smaller number rather than a refusal, so
+// the remainder of an allowance is spent rather than stranded.
+//
+// `metered` says whether any of this applied. An unidentified caller and a subscriber both
+// come back with the full amount and metered false, which is what stops a trim being
+// applied to someone who is not being metered at all.
+async function freeCharge(req: any, metric: 'design' | 'offtarget', want: number)
+    : Promise<{ allowed: number; gate: any | null; metered: boolean }> {
+    const n = Math.max(0, Math.floor(want || 0));
     const email = freeUserKey(req);
-    if (!email) return null;                 // unidentified: not metered here
-    if (await isSubscribed(email)) return null;    // subscribers are unlimited
+    if (!email) return { allowed: n, gate: null, metered: false };
+    if (await isSubscribed(email)) return { allowed: n, gate: null, metered: false };
+
     const used = freeUsedFor(email);
-    if ((used as any)[metric] >= freeLimitFor(metric)) {
-        return {
-            error: 'free-limit',
-            metric,
-            used: (used as any)[metric],
-            limit: freeLimitFor(metric),
-            resetsOn: periodResetsOn(),
-            // The off-target line is deliberately short and light: it is shown on the canvas
-            // mid-run, where a sentence about allowances and reset dates reads as a failure.
-            // resetsOn is still in the payload for anything that wants to spell it out.
-            message: (metric === 'design'
-                ? 'You have used all ' + freeLimitFor('design') + ' free designs this month.'
-                + ' Your allowance resets on ' + periodResetsOn() + ' — or subscribe for unlimited use.'
-                : 'No more free GPU time.  ;-)')
-        };
+    const limit = freeLimitFor(metric);
+    const remaining = Math.max(0, limit - (used as any)[metric]);
+
+    if (remaining <= 0) {
+        return { allowed: 0, metered: true, gate: freeLimitBody(metric, (used as any)[metric]) };
     }
+
+    const take = Math.min(n, remaining);
     const all = loadFreeUsage();
     const period = currentPeriod();
     // Roll the row over on the first call of a new month rather than accumulating.
     if (!all[email] || all[email].period !== period) all[email] = { period, design: 0, offtarget: 0 } as any;
-    (all[email] as any)[metric] += 1;
+    (all[email] as any)[metric] += take;
     saveFreeUsage();
-    return null;
+    return { allowed: take, gate: null, metered: true };
+}
+
+// The 402 body, kept in one place so the wording cannot drift between callers.
+function freeLimitBody(metric: 'design' | 'offtarget', usedNow: number): any {
+    return {
+        error: 'free-limit',
+        metric,
+        used: usedNow,
+        limit: freeLimitFor(metric),
+        resetsOn: periodResetsOn(),
+        // The off-target line is deliberately short and light: it is shown on the canvas
+        // mid-run, where a sentence about allowances and reset dates reads as a failure.
+        // resetsOn is still in the payload for anything that wants to spell it out.
+        message: (metric === 'design'
+            ? 'You have used all ' + freeLimitFor('design') + ' free designs this month.'
+            + ' Your allowance resets on ' + periodResetsOn() + ' — or subscribe for unlimited use.'
+            : 'That is all ' + freeLimitFor('offtarget') + ' free off-target compounds this month.  ;-)')
+    };
+}
+
+// The one-unit case, which is every metered call except the off-target screen.
+async function freeGate(req: any, metric: 'design' | 'offtarget'): Promise<any | null> {
+    return (await freeCharge(req, metric, 1)).gate;
 }
 
 // What the client shows as "N of 5 used" and uses to decide whether to offer the upgrade.
@@ -9790,6 +9873,121 @@ app.get('/download-book', requireAppAccess, async (req: AuthedRequest, res: Resp
     }
 });
 
+
+
+// ---------------------------------------------------------------------------------------
+//  GET /download-user-file  —  stream a file out of a user's drive, byte for byte.
+//
+//  WHY THIS EXISTS, ALONGSIDE /download AND /load-file.
+//
+//    /download        takes an ABSOLUTE filesystem path and UNLINKS the file once it has
+//                     streamed it. It is for handing over temporary artefacts. Pointing it
+//                     at something in a user's drive downloads their file and then deletes
+//                     it, so it must never be used for this.
+//
+//    /load-file       reads with a utf-8 encoding, so anything that is not text comes back
+//                     with its undecodable bytes replaced. Fine for the JSON documents this
+//                     application writes, wrong for a VCF index, an image or an archive.
+//
+//  This one streams the bytes and changes nothing on disk.
+//
+//  ACCESS. Two independent checks, both required:
+//
+//    1. CONTAINMENT — the resolved path must sit inside the user-drive root. This is what
+//       stops "../../etc/passwd" and it is done on the NORMALISED path, so it cannot be
+//       walked around with extra slashes or dot segments.
+//
+//    2. OWNERSHIP — the resolved path must contain the caller's own encoded id, or the
+//       directory must carry a .share naming them or marked /public. That is the same rule
+//       POST /load-file applies, kept identical on purpose: one access model for reading a
+//       user's file, not two that can drift apart.
+//
+//  Only the 'user' drive is served. The source tree and the config drive are reachable
+//  through getKey() and have no business being downloadable by path.
+app.get('/download-user-file', async (req, res) => {
+    try {
+        const raw = String(req.query.path || '').trim();
+        const user = String(req.query.user || '').trim();
+        const drive = String(req.query.key || 'user').trim().toLowerCase();
+
+        if (!raw) return res.status(400).json({ msg: 'Missing path.' });
+        if (!user) return res.status(400).json({ msg: 'Missing user.' });
+        if (drive !== 'user') return res.status(403).json({ msg: 'Only the user drive can be downloaded.' });
+
+        const dir = getKey('user');
+        if (!dir) return res.status(500).json({ msg: 'Missing user directory.' });
+        const baseRoot = path.posix.normalize(dir.replace(/\/+$/, ''));
+
+        // The browser hands back paths rooted at the drive, sometimes with the /user/ or
+        // /myfiles/ alias in front. Resolve those the way every other endpoint does, so a
+        // path that works for opening a file also works for downloading it.
+        const puser = encodeEmail(user);
+        let rel = raw;
+        if (rel.indexOf('/myfiles/') >= 0) rel = rel.replace('/myfiles/', '/' + puser + '/');
+        else rel = rel.replace('/user/', '/' + puser + '/');
+        rel = rel.replace(/\/+/g, '/');
+        if (rel.startsWith('/')) rel = rel.substring(1);
+
+        const filePath = path.posix.normalize(path.posix.join(baseRoot, rel));
+
+        // 1. containment
+        if (!(filePath === baseRoot || filePath.startsWith(baseRoot + '/'))) {
+            console.log('[download-user-file] refused, outside the drive:', filePath);
+            return res.status(403).json({ msg: 'Security Error Logged.' });
+        }
+
+        // 2. ownership, or an explicit share
+        if (filePath.indexOf(puser) < 0) {
+            let allowed = false;
+            try {
+                const shareFilePath = path.posix.join(path.posix.dirname(filePath), '.share');
+                if (fs.existsSync(shareFilePath)) {
+                    const lines = fs.readFileSync(shareFilePath, 'utf-8')
+                        .split('\n').map((l: string) => l.trim());
+                    allowed = lines.includes('/public') || lines.includes('public') || lines.includes(user);
+                }
+            } catch (e) {
+                allowed = false;
+            }
+            if (!allowed) {
+                console.log('[download-user-file] refused, not the owner and not shared:', filePath);
+                return res.status(403).json({ msg: 'You do not have access to this resource.' });
+            }
+        }
+
+        let st: any;
+        try {
+            st = fs.statSync(filePath);
+        } catch (e) {
+            return res.status(404).json({ msg: 'File not found.' });
+        }
+        if (st.isDirectory()) return res.status(400).json({ msg: 'That is a folder, not a file.' });
+
+        // A file name reaches this header from whatever the user typed, so quotes and
+        // newlines are stripped from the plain form and the real name is carried in the
+        // RFC 5987 field, which is where anything non-ASCII belongs.
+        const base = path.posix.basename(filePath) || 'download';
+        const asciiName = base.replace(/["\\\r\n]/g, '_').replace(/[^\x20-\x7e]/g, '_');
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.setHeader('Content-Length', String(st.size));
+        res.setHeader('Content-Disposition',
+            'attachment; filename="' + asciiName + '"; filename*=UTF-8\'\'' + encodeURIComponent(base));
+        // The bytes are the file; nothing downstream should reinterpret them.
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+
+        const stream = fs.createReadStream(filePath);
+        stream.on('error', (err: any) => {
+            console.error('[download-user-file] stream error:', err);
+            if (!res.headersSent) res.status(500).json({ msg: 'Failed to read the file.' });
+            else res.destroy();
+        });
+        // NOTE: no unlink. This endpoint reads; it never removes.
+        stream.pipe(res);
+    } catch (error) {
+        console.error('[download-user-file] error:', error);
+        if (!res.headersSent) res.status(500).json({ msg: 'Internal Server Error' });
+    }
+});
 
 
 app.get('/download', async (req, res) => {
