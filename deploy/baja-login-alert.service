@@ -1,0 +1,19 @@
+[Unit]
+Description=baja login alert — emails when a user signs in
+After=network-online.target baja-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/baja-login-alert
+EnvironmentFile=/opt/baja-server/.env
+Environment=NODE_PATH=/opt/baja-server/node_modules
+Environment=LOGIN_ALERT_TO=milton@baja.bio
+Environment=LOGIN_ALERT_STATE=/opt/baja-login-alert/state.json
+ExecStart=/usr/bin/node /opt/baja-login-alert/login-alert.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

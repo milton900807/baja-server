@@ -1,0 +1,21 @@
+# Web image: build the Angular bundle, then serve it with nginx.
+# Build context = baja/ (the Angular repo). Referenced by docker-compose.yml service "web".
+# (BuildKit required because this Dockerfile lives outside the build context.)
+
+# ---- stage 1: build the production bundle ----
+FROM node:20-bookworm-slim AS build
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --legacy-peer-deps
+COPY . .
+# Angular CLI is a devDependency; use the local binary.
+RUN node --max-old-space-size=4096 ./node_modules/@angular/cli/bin/ng build \
+      --base-href / --configuration production
+
+# ---- stage 2: nginx serving the static bundle ----
+FROM nginx:1.27-alpine
+# Angular outputs to dist/ (see angular.json outputPath).
+COPY --from=build /app/dist/ /usr/share/nginx/html/
+# The site config (upstream api:8080) and env.js are mounted by compose, not baked,
+# so they can change without a rebuild.
+EXPOSE 80 443
