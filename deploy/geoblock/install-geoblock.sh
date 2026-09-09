@@ -22,8 +22,16 @@ set -uo pipefail
 
 DIR=/etc/nginx/baja-geoblock
 CONFD=/etc/nginx/conf.d
-INCLUDE_LINE='    include /etc/nginx/baja-geoblock/enforce.conf;   # geographic block'
-MARKER='baja-geoblock/enforce.conf'
+# A WILDCARD, and not for tidiness. nginx treats a literal `include` of a file that does
+# not exist as a FATAL error -- the config test fails and the server will not start -- while
+# an include whose glob matches nothing is fine. These lines end up in the site configs, and
+# the site configs are templates that get deployed to other machines; a literal include
+# would mean any machine without /etc/nginx/baja-geoblock bricks nginx on first start.
+# Matching exactly one file, it behaves identically to the literal form here.
+INCLUDE_LINE='    include /etc/nginx/baja-geoblock/enforce*.conf;   # geographic block'
+# Without the .conf, so the marker recognises both this form and the literal one an earlier
+# install wrote -- otherwise `install` would add a second include beside the first.
+MARKER='baja-geoblock/enforce'
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 need_root() { [ "$(id -u)" = 0 ] || die "run this with sudo"; }
