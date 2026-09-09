@@ -73,6 +73,100 @@ const port = 8080; // default port to listen
 app.use(express.json({ limit: '8gb' })); // Note: Be cautious with such large limits
 app.use(express.urlencoded({ limit: '8gb', extended: true })); // For URL-encoded payloads
 app.use(bodyParser.json());
+
+// ---------------------------------------------------------------------------------------
+//  ACCESS CONTROL -- refuse blocked users, and force a signed-out user to sign in again.
+//
+//  WHAT THIS IS, AND WHAT IT IS NOT.
+//
+//  There is no session store and no token verification here: a request says who it is by
+//  putting an email in the query string or the body, and the server believes it. So this
+//  stops a blocked person USING THE APP -- their client sends their address and every
+//  identified call is refused -- but it is not a security boundary, because anyone willing
+//  to edit a request can send a different address. Treat it as account suspension, not as
+//  authentication. Making it more than that means verifying the OIDC id_token on every
+//  request, which is a separate piece of work.
+//
+//  Two states, kept in one file so an operator edits one thing:
+//    blocked  -- refused (403) until an operator unblocks them
+//    signedOutAt -- refused (401) until they sign in again, which the OIDC token endpoint
+//                   clears. This is what "log them out" can mean without a session to kill.
+//
+//  The file is read from disk on demand and cached against its mtime, so an operator's edit
+//  takes effect within a second without restarting the API, and a busy server is not
+//  stat-ing it on every request either.
+// ---------------------------------------------------------------------------------------
+const ACCESS_FILE = path.join(environment.userData, 'access-control.json');
+let __accessCache: { blocked: any, signedOut: any } = { blocked: {}, signedOut: {} };
+let __accessMtime = 0;
+let __accessChecked = 0;
+
+function accessRules() {
+    const now = Date.now();
+    if (now - __accessChecked < 1000) return __accessCache;   // at most one stat per second
+    __accessChecked = now;
+    try {
+        const st = fs.statSync(ACCESS_FILE);
+        if (st.mtimeMs === __accessMtime) return __accessCache;
+        const raw = JSON.parse(fs.readFileSync(ACCESS_FILE, 'utf-8') || '{}');
+        const blocked: any = {}, signedOut: any = {};
+        for (const [k, v] of Object.entries(raw.blocked || {})) blocked[String(k).trim().toLowerCase()] = v;
+        for (const [k, v] of Object.entries(raw.signedOut || {})) signedOut[String(k).trim().toLowerCase()] = v;
+        __accessCache = { blocked, signedOut };
+        __accessMtime = st.mtimeMs;
+    } catch {
+        // No file, or unreadable/corrupt: nobody is blocked. Failing OPEN is deliberate --
+        // a typo in this file must not lock every user out of the application.
+        if (__accessMtime !== 0) { __accessCache = { blocked: {}, signedOut: {} }; __accessMtime = 0; }
+    }
+    return __accessCache;
+}
+
+// The address a request claims. Every endpoint spells it differently, which is why this
+// looks in all of them rather than at one field.
+function claimedEmail(req: any): string {
+    const q = req.query || {}, b = (req.body && typeof req.body === 'object') ? req.body : {};
+    const v = q.user || q.email || q.userId || b.user || b.email || b.userId
+        || req.headers['x-user-id'];
+    const s = ('' + (v == null ? '' : v)).trim().toLowerCase();
+    return s.indexOf('@') > 0 ? s : '';
+}
+
+function clearForcedSignOut(email: string) {
+    try {
+        const who = ('' + email).trim().toLowerCase();
+        if (!who) return;
+        const raw = fs.existsSync(ACCESS_FILE)
+            ? JSON.parse(fs.readFileSync(ACCESS_FILE, 'utf-8') || '{}') : {};
+        if (!raw.signedOut || !(who in raw.signedOut)) return;
+        delete raw.signedOut[who];
+        fs.writeFileSync(ACCESS_FILE, JSON.stringify(raw, null, 2));
+        __accessMtime = 0;   // force the next read to pick this up
+    } catch { }
+}
+
+app.use((req: any, res: any, next: any) => {
+    const who = claimedEmail(req);
+    if (!who) return next();                       // unidentified: nothing to match on
+    const rules = accessRules();
+    const b = rules.blocked[who];
+    if (b) {
+        return res.status(403).json({
+            error: 'account_blocked',
+            message: (b && b.message) || 'This account has been suspended.',
+            contact: 'contact@baja.bio',
+        });
+    }
+    const so = rules.signedOut[who];
+    if (so) {
+        return res.status(401).json({
+            error: 'signed_out',
+            message: (so && so.message) || 'You have been signed out. Please sign in again.',
+        });
+    }
+    return next();
+});
+
 app.use("/api", routes);
 
 import milestoneQueriesRouter from './models/mileston-db';
@@ -1104,7 +1198,7 @@ function isYeastTranscriptId(transcriptId: string): boolean {
 // transcript that carries it, from the region index rather than from a guess.
 function resolveYeastTranscriptId(transcriptId: string): string {
     const id = String(transcriptId || "").trim();
-    const idx = annotationRegionIndex["yeast"];
+    const idx = annotationRegionIndex.yeast;
     if (!idx || idx.has(id)) return id;
     for (const suf of YEAST_TRANSCRIPT_SUFFIXES) {
         if (suf && idx.has(id + suf)) return id + suf;
@@ -3144,6 +3238,15 @@ app.post(['/oidc/token', '/api/oidc/token'], async (req: any, res: any) => {
                 who = String(payload.email || payload.preferred_username || payload.upn || payload.sub || '');
             }
             console.log(`[login] provider=${String(provider || '').toLowerCase()} user=${who || '(unknown)'}`);
+            // A FORCED SIGN-OUT ENDS HERE, and only here. Signing someone out means their
+            // client keeps working until it is told otherwise, so the middleware above
+            // refuses them until they authenticate again -- and this is the moment that
+            // happened. Clearing it here is what makes "log them out" different from
+            // "block them": one survives a fresh sign-in, the other does not.
+            //
+            // A BLOCKED account is deliberately not cleared: signing in again must not
+            // lift a suspension.
+            if (who) clearForcedSignOut(who);
         } catch { }
         return res.json(json);
     } catch (e: any) {

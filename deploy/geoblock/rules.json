@@ -1,0 +1,13 @@
+{
+  "_comment": [
+    "Places refused by the geographic block. Rebuild after editing:",
+    "  sudo /opt/venv/bin/python3 /opt/baja-geo/build-geoblock.py && sudo nginx -t && sudo systemctl reload nginx",
+    "A rule needs country_iso, and may narrow with city and/or region.",
+    "A country-only rule reads the small country database; naming a city means",
+    "walking the 14-million-network city database, which takes a couple of minutes."
+  ],
+  "block": [
+    { "country_iso": "AD", "_why": "Andorra la Vella: 5,205 requests from 27 IPs over 14 days, no signed-in user" },
+    { "country_iso": "ID", "city": "Jakarta", "_why": "14,826 requests from 13 IPs over 14 days, no signed-in user" }
+  ]
+}
