@@ -149,10 +149,32 @@ if [[ -z "$DRY" ]]; then
   c "Restarting services…"
   on_remote "$RESTART_CMD"
   ok "restarted"
-  if curl -fsS --max-time 15 "https://$DOMAIN/stripe/price-info" >/tmp/_pi 2>/dev/null; then
+  # WAIT FOR THE API, do not race it.
+  #
+  # systemctl returns as soon as the unit is started, not when node is accepting
+  # connections, so probing immediately gets nginx's own 502 in about 200ms. curl
+  # -f then fails instantly -- --max-time never comes into it, because a 502 is a
+  # reply, not a timeout -- and every deploy ended on a warning about a service
+  # that was in fact fine a second later.
+  #
+  # Retry until it answers. 502/503 and a refused connection all mean "not up yet";
+  # anything else is the answer, good or bad.
+  c "Waiting for the API to answer…"
+  __pi_ok=0
+  for __i in $(seq 1 30); do
+    if curl -fsS --max-time 5 "https://$DOMAIN/stripe/price-info" >/tmp/_pi 2>/dev/null; then
+      __pi_ok=1; break
+    fi
+    sleep 2
+  done
+  if [[ "$__pi_ok" == 1 ]]; then
     ok "https://$DOMAIN/stripe/price-info → $(cat /tmp/_pi)"; rm -f /tmp/_pi
   else
-    warn "price-info not reachable — check: ${SSH[*]} 'journalctl -u baja-server -n 40'"
+    # Say what it actually returned, so a real outage is distinguishable from a
+    # slow start without going to the journal first.
+    __code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "https://$DOMAIN/stripe/price-info" 2>/dev/null || echo 000)"
+    warn "price-info still not answering after 60s (last HTTP $__code) — check: ${SSH[*]} 'journalctl -u baja-server -n 40'"
+    rm -f /tmp/_pi
   fi
 else
   c "Dry run complete — nothing changed."
