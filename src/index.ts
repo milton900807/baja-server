@@ -6754,7 +6754,12 @@ if (SHARE_MAIL_FROM) {
         send: async (m) => {
             if (!transport) {
                 const nodemailer = require('nodemailer');
-                transport = nodemailer.createTransport({ host, port, secure: port === 465, requireTLS: true, connectionTimeout: 15000 });
+                // The EHLO name matters: Google's relay answers "421-4.7.0 Try again later,
+                // closing connection. (EHLO)" when a client introduces itself by the EC2
+                // instance's private hostname (ip-172-31-70-154), and accepts the same
+                // connection announced as the public name. Nodemailer defaults to os.hostname().
+                const name = process.env.SMTP_EHLO_NAME || 'oligodesigner.com';
+                transport = nodemailer.createTransport({ host, port, name, secure: port === 465, requireTLS: true, connectionTimeout: 15000 });
             }
             await transport.sendMail({ from: '"' + fromName.replace(/"/g, '') + '" <' + SHARE_MAIL_FROM + '>', to: m.to, subject: m.subject, text: m.text, html: m.html });
         }
