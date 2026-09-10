@@ -12447,9 +12447,14 @@ try {
 
 
 
-    // The share invite goes out from the configured sender, falling back to the address
-    // deploy/login-alert.js already sends from on this tenant.
-    const __mailFrom = userId || process.env.LOGIN_ALERT_FROM || 'milton@lajollalabs.com';
+    // The share invite goes out from the first sender Graph accepts. SENDER_USER_ID is
+    // tried first, but on production it names a mailbox this tenant does not have
+    // ("The requested user 'milton@baja.bio' is invalid"), so the address
+    // deploy/login-alert.js already sends from is tried next. Whichever works is kept for
+    // the rest of the process, so only the first send pays for the failed attempts.
+    const __mailSenders = Array.from(new Set([process.env.SHARE_MAIL_FROM, userId, process.env.LOGIN_ALERT_FROM, 'milton@lajollalabs.com']
+        .map((v) => ('' + (v || '')).trim()).filter(Boolean)));
+    let __mailFrom = '';
     __bajaMailer = async (m) => {
         const message = {
             message: {
@@ -12459,7 +12464,20 @@ try {
             },
             saveToSentItems: true,
         };
-        await graphClient.api(`/users/${__mailFrom}/sendMail`).post(message);
+        const candidates = __mailFrom ? [__mailFrom] : __mailSenders;
+        let lastErr: any = null;
+        for (const from of candidates) {
+            try {
+                await graphClient.api(`/users/${from}/sendMail`).post(message);
+                if (__mailFrom !== from) console.log('[mail] sending as ' + from);
+                __mailFrom = from;
+                return;
+            } catch (e: any) {
+                lastErr = e;
+                console.error('[mail] send as ' + from + ' failed: ' + String((e && e.message) || e));
+            }
+        }
+        throw lastErr || new Error('No mail sender is configured.');
     };
 
     app.get('/test-mail', async (req, res) => {
