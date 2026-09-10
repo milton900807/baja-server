@@ -7154,6 +7154,8 @@ app.get('/share-resolve', (req, res) => {
 //
 // One code per (owner, recipient, design name): sharing the same design with the same
 // person again refreshes the snapshot and keeps the link they already have.
+// The product name in the invite, the same one the sender's display name uses.
+const SHARE_PRODUCT_NAME = process.env.SHARE_MAIL_FROM_NAME || 'GeneTx Designer';
 const PERSON_SHARE_FILE = path.join(userData, 'person-shares.json');
 type PersonShare = { code: string; owner: string; to: string; name: string; path: string; message: string; created: number; updated: number };
 let __personShares: { [code: string]: PersonShare } | null = null;
@@ -7258,11 +7260,11 @@ app.post('/share-with', async (req, res) => {
                 await __bajaMailer({
                     to,
                     subject: owner + ' shared a design with you: ' + designLabel,
-                    text: owner + ' has shared the oligo design "' + designLabel + '" with you on Oligodesigner.\n\n'
+                    text: owner + ' has shared the oligo design "' + designLabel + '" with you on ' + SHARE_PRODUCT_NAME + '.\n\n'
                         + 'Open it here: ' + url + '\n' + note
                         + '\nThe link is for ' + to + '. If you do not have an account yet, sign in with the free option and the design will open once you are in.\n',
                     html: '<div style="font-family:Segoe UI,system-ui,Arial,sans-serif;font-size:14px;color:#14202b;line-height:1.5;">'
-                        + '<p><b>' + shareEscapeHtml(owner) + '</b> has shared the oligo design <b>' + shareEscapeHtml(designLabel) + '</b> with you on Oligodesigner.</p>'
+                        + '<p><b>' + shareEscapeHtml(owner) + '</b> has shared the oligo design <b>' + shareEscapeHtml(designLabel) + '</b> with you on ' + shareEscapeHtml(SHARE_PRODUCT_NAME) + '.</p>'
                         + '<p><a href="' + shareEscapeHtml(url) + '" style="display:inline-block;padding:10px 18px;background:#12c2e0;color:#062430;text-decoration:none;border-radius:8px;font-weight:700;">Open the design</a></p>'
                         + '<p style="font-size:12px;color:#5b6b78;">Or paste this link into your browser: ' + shareEscapeHtml(url) + '</p>'
                         + (message ? ('<blockquote style="border-left:3px solid #d8e0e6;margin:12px 0;padding:6px 12px;color:#334;white-space:pre-wrap;">' + shareEscapeHtml(message) + '</blockquote>') : '')
