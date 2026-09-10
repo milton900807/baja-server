@@ -6702,6 +6702,59 @@ const SHARE_ALIAS_FILE = path.join(userData, 'share-aliases.json');
 // treats that as a non-fatal condition -- the link is still shown to the sharer.
 let __bajaMailer: ((m: { to: string; subject: string; text: string; html?: string }) => Promise<void>) | null = null;
 
+// HOW MAIL LEAVES THIS SERVER. Senders are tried in order and the first one that works is
+// remembered for the rest of the process:
+//
+//   1. Google Workspace SMTP relay, as SHARE_MAIL_FROM (noreply@gene.clinic). The relay
+//      authorises by the server's IP address, so there are no credentials on the box; it
+//      has to be switched on in the Workspace admin console (Apps > Gmail > Routing > SMTP
+//      relay service) with this server's address allowed. Every domain we send for has its
+//      mail at Google, which is why this comes first.
+//   2. Microsoft Graph, as each candidate mailbox in turn (set up further down, inside the
+//      try block that builds the Graph client). Kept as the fallback so an invite still
+//      goes out while the relay is not yet enabled.
+type MailMessage = { to: string; subject: string; text: string; html?: string };
+type MailSender = { name: string; send: (m: MailMessage) => Promise<void> };
+const __mailSenders: MailSender[] = [];
+let __mailSenderInUse: MailSender | null = null;
+function installMailer(): void {
+    __bajaMailer = async (m) => {
+        const candidates = __mailSenderInUse ? [__mailSenderInUse] : __mailSenders;
+        let lastErr: any = null;
+        for (const s of candidates) {
+            try {
+                await s.send(m);
+                if (__mailSenderInUse !== s) console.log('[mail] sending via ' + s.name);
+                __mailSenderInUse = s;
+                return;
+            } catch (e: any) {
+                lastErr = e;
+                console.error('[mail] ' + s.name + ' failed: ' + String((e && e.message) || e));
+            }
+        }
+        throw lastErr || new Error('No mail sender is configured.');
+    };
+}
+const SHARE_MAIL_FROM = ('' + (process.env.SHARE_MAIL_FROM || '')).trim();
+if (SHARE_MAIL_FROM) {
+    const host = process.env.SMTP_RELAY_HOST || 'smtp-relay.gmail.com';
+    const port = +(process.env.SMTP_RELAY_PORT || 587);
+    const fromName = process.env.SHARE_MAIL_FROM_NAME || 'Oligodesigner';
+    let transport: any = null;
+    __mailSenders.push({
+        name: 'smtp-relay ' + host + ' as ' + SHARE_MAIL_FROM,
+        send: async (m) => {
+            if (!transport) {
+                const nodemailer = require('nodemailer');
+                transport = nodemailer.createTransport({ host, port, secure: port === 465, requireTLS: true, connectionTimeout: 15000 });
+            }
+            await transport.sendMail({ from: '"' + fromName.replace(/"/g, '') + '" <' + SHARE_MAIL_FROM + '>', to: m.to, subject: m.subject, text: m.text, html: m.html });
+        }
+    });
+    installMailer();
+    console.log('[mail] SMTP relay configured: ' + host + ':' + port + ' as ' + SHARE_MAIL_FROM);
+}
+
 // ---------------------------------------------------------------------------------------
 // FREE-TIER METERING
 //
@@ -12447,38 +12500,28 @@ try {
 
 
 
-    // The share invite goes out from the first sender Graph accepts. SENDER_USER_ID is
-    // tried first, but on production it names a mailbox this tenant does not have
-    // ("The requested user 'milton@baja.bio' is invalid"), so the address
-    // deploy/login-alert.js already sends from is tried next. Whichever works is kept for
-    // the rest of the process, so only the first send pays for the failed attempts.
-    const __mailSenders = Array.from(new Set([process.env.SHARE_MAIL_FROM, userId, process.env.LOGIN_ALERT_FROM, 'milton@lajollalabs.com']
-        .map((v) => ('' + (v || '')).trim()).filter(Boolean)));
-    let __mailFrom = '';
-    __bajaMailer = async (m) => {
-        const message = {
-            message: {
-                subject: m.subject,
-                body: m.html ? { contentType: 'HTML', content: m.html } : { contentType: 'Text', content: m.text },
-                toRecipients: [{ emailAddress: { address: m.to } }],
-            },
-            saveToSentItems: true,
-        };
-        const candidates = __mailFrom ? [__mailFrom] : __mailSenders;
-        let lastErr: any = null;
-        for (const from of candidates) {
-            try {
+    // Graph mailboxes, tried after the SMTP relay. SENDER_USER_ID is first, but on
+    // production it names a mailbox this tenant does not have ("The requested user
+    // 'milton@baja.bio' is invalid"), so the address deploy/login-alert.js already sends
+    // from is tried next.
+    for (const from of Array.from(new Set([userId, process.env.LOGIN_ALERT_FROM, 'milton@lajollalabs.com']
+        .map((v) => ('' + (v || '')).trim()).filter(Boolean)))) {
+        __mailSenders.push({
+            name: 'graph as ' + from,
+            send: async (m) => {
+                const message = {
+                    message: {
+                        subject: m.subject,
+                        body: m.html ? { contentType: 'HTML', content: m.html } : { contentType: 'Text', content: m.text },
+                        toRecipients: [{ emailAddress: { address: m.to } }],
+                    },
+                    saveToSentItems: true,
+                };
                 await graphClient.api(`/users/${from}/sendMail`).post(message);
-                if (__mailFrom !== from) console.log('[mail] sending as ' + from);
-                __mailFrom = from;
-                return;
-            } catch (e: any) {
-                lastErr = e;
-                console.error('[mail] send as ' + from + ' failed: ' + String((e && e.message) || e));
             }
-        }
-        throw lastErr || new Error('No mail sender is configured.');
-    };
+        });
+    }
+    installMailer();
 
     app.get('/test-mail', async (req, res) => {
         try {
