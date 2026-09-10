@@ -7407,16 +7407,40 @@ app.post('/export-table', async (req, res) => {
             const pageW = 612, pageH = 792, top = pageH - margin, bottomLimit = margin;
             let page = doc.addPage([pageW, pageH]);
             let y = top;
-            const clip = (t: string, max: number) => {
-                let out = '' + t; const maxChars = Math.floor(max / (size * 0.52));
-                if (out.length > maxChars) out = out.slice(0, Math.max(1, maxChars - 1)) + '…';
-                // Helvetica cannot encode every code point; keep it to printable ASCII plus the ellipsis.
-                return out.replace(/[^\x20-\x7e…]/g, '?');
+            // Helvetica cannot encode every code point; keep it to printable ASCII.
+            const sanitize = (t: string) => ('' + t).replace(/[^\x20-\x7e]/g, '?');
+            // WRAP long values across lines rather than truncating them -- a chemistry string or
+            // a synthesis sequence must show in full in a report, never abbreviated with an
+            // ellipsis. Break at a space or a chemistry delimiter when one is near the edge,
+            // otherwise hard-break.
+            const wrapText = (text: string, maxChars: number): string[] => {
+                const str = sanitize(text);
+                if (str.length <= maxChars) return [str];
+                const out: string[] = [];
+                let i = 0;
+                while (i < str.length) {
+                    let end = Math.min(i + maxChars, str.length);
+                    if (end < str.length) {
+                        const win = str.slice(i, end);
+                        const sp = win.lastIndexOf(' ');
+                        const delim = Math.max(win.lastIndexOf(')'), win.lastIndexOf('.'), win.lastIndexOf('|'), win.lastIndexOf(','), win.lastIndexOf('-'));
+                        const brk = (sp > maxChars * 0.5) ? sp + 1 : (delim > maxChars * 0.5 ? delim + 1 : -1);
+                        if (brk > 0) end = i + brk;
+                    }
+                    out.push(str.slice(i, end));
+                    i = end;
+                }
+                return out;
             };
             const line = (text: string, f: any, sz: number, indent = 0) => {
-                if (y < bottomLimit) { page = doc.addPage([pageW, pageH]); y = top; }
-                page.drawText(clip(text, pageW - margin * 2 - indent), { x: margin + indent, y, size: sz, font: f });
-                y -= (sz + 3.5);
+                const maxChars = Math.max(6, Math.floor((pageW - margin * 2 - indent) / (sz * 0.52)));
+                const segs = wrapText('' + text, maxChars);
+                for (let k = 0; k < segs.length; k++) {
+                    if (y < bottomLimit) { page = doc.addPage([pageW, pageH]); y = top; }
+                    const ind = indent + (k > 0 ? 14 : 0);   // hanging indent for a continued line
+                    page.drawText(segs[k], { x: margin + ind, y, size: sz, font: f });
+                    y -= (sz + 3.5);
+                }
             };
             if (title) { line(title, bold, 15); y -= 4; }
             for (const sh of sheets) {
