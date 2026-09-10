@@ -6747,7 +6747,7 @@ const SHARE_MAIL_FROM = ('' + (process.env.SHARE_MAIL_FROM || '')).trim();
 if (SHARE_MAIL_FROM) {
     const host = process.env.SMTP_RELAY_HOST || 'smtp-relay.gmail.com';
     const port = +(process.env.SMTP_RELAY_PORT || 587);
-    const fromName = process.env.SHARE_MAIL_FROM_NAME || 'Oligodesigner';
+    const fromName = process.env.SHARE_MAIL_FROM_NAME || 'GeneTx Designer';
     let transport: any = null;
     __mailSenders.push({
         name: 'smtp-relay ' + host + ' as ' + SHARE_MAIL_FROM,
