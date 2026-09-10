@@ -62,6 +62,25 @@ DATA_CONFIG_EXCLUDES=(
   --exclude '*.bam' --exclude '*.bai' --exclude '*.2bit' --exclude '*.fa' --exclude '*.fa.gz'
 )
 
+# EDITOR SCRATCH AND BUILD CACHES, which are not code and have no business on the server.
+#
+# A working tree accumulates these between commits -- an editor writing foo.js.bak_before
+# beside foo.js, python leaving __pycache__ under every package it imports -- and rsync
+# ships whatever it finds. Three such backups reached /opt/baja-apps this way and had to be
+# deleted there by hand.
+#
+# '*.bak_*' and NOT '*.bak': py/ppsets/models/model.joblib.bak is a TRACKED file that is
+# meant to be deployed, and the blanket pattern would silently stop updating it. The
+# scratch files all carry a suffix after the dot-bak, so the narrower glob catches them
+# and leaves real content alone.
+#
+# Excluded files are also protected from --delete, so anything already on the server stays
+# where it is; this stops new junk arriving rather than cleaning up what has.
+JUNK_EXCLUDES=(
+  --exclude '*.bak_*' --exclude '*.orig' --exclude '*.rej'
+  --exclude '__pycache__' --exclude '*.pyc'
+)
+
 # ---- preflight --------------------------------------------------------------
 c "Preflight — $SERVER (code-only; data & config preserved)"
 [[ -f "$SSH_KEY" ]] || die "SSH key not found: $SSH_KEY"
@@ -101,14 +120,14 @@ fi
 # ---- backend + lionscript: code only ---------------------------------------
 if want_be; then
   c "Syncing API code → $REMOTE_API  (.env, data, config preserved)"
-  "${RSYNC[@]}" --delete "${DATA_CONFIG_EXCLUDES[@]}" "$SRV_DIR/" "$SERVER:$REMOTE_API/"
+  "${RSYNC[@]}" --delete "${DATA_CONFIG_EXCLUDES[@]}" "${JUNK_EXCLUDES[@]}" "$SRV_DIR/" "$SERVER:$REMOTE_API/"
 
   c "Syncing lionscript code → $REMOTE_APPS  (data & config preserved)"
   # '*.egg-info' is written on the server by the venv's editable installs (sudo pip -e),
   # is root-owned, and must survive: deleting it would break those installs, and rsync
   # cannot delete it anyway (exit 23, which aborts the deploy before the restart).
   "${RSYNC[@]}" --delete --exclude '.git' --exclude 'node_modules' --exclude '*.egg-info' \
-    --exclude 'data' --exclude 'config' "$APPS_DIR/" "$SERVER:$REMOTE_APPS/"
+    --exclude 'data' --exclude 'config' "${JUNK_EXCLUDES[@]}" "$APPS_DIR/" "$SERVER:$REMOTE_APPS/"
 
   # Lionscript modules that live under data/ dirs (e.g. baja/data/*.js) are code but get
   # caught by the 'data' exclusion above — sync ONLY the .js files under baja/ so edits to
