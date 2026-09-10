@@ -6717,9 +6717,17 @@ type MailMessage = { to: string; subject: string; text: string; html?: string };
 type MailSender = { name: string; send: (m: MailMessage) => Promise<void> };
 const __mailSenders: MailSender[] = [];
 let __mailSenderInUse: MailSender | null = null;
+let __mailLastFullProbe = 0;
+// A fallback is not pinned for good: when the sender in use is not the preferred one, the
+// whole list is tried again every ten minutes, so switching the relay on in the Workspace
+// console takes effect without a restart.
+const MAIL_REPROBE_MS = 10 * 60 * 1000;
 function installMailer(): void {
     __bajaMailer = async (m) => {
-        const candidates = __mailSenderInUse ? [__mailSenderInUse] : __mailSenders;
+        const preferred = __mailSenders[0] || null;
+        const stale = __mailSenderInUse && __mailSenderInUse !== preferred && (Date.now() - __mailLastFullProbe) > MAIL_REPROBE_MS;
+        const candidates = (__mailSenderInUse && !stale) ? [__mailSenderInUse] : __mailSenders;
+        if (candidates === __mailSenders) __mailLastFullProbe = Date.now();
         let lastErr: any = null;
         for (const s of candidates) {
             try {
