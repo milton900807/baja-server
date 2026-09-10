@@ -7353,6 +7353,99 @@ app.get('/share-open', (req, res) => {
     }
 });
 
+// ---- Turn rows into an XLSX or a PDF ---------------------------------------------------
+//
+// The editor's Download library builds BED, JSON and CSV in the browser, where they are just
+// text. XLSX and PDF are not, and the two libraries that make them (node-xlsx, pdf-lib) are
+// already imported here, so the client posts the rows and gets bytes back rather than shipping
+// a spreadsheet or PDF library into the page.
+//
+// Body: { format: 'xlsx' | 'pdf', filename, title?, sheets: [{ name, columns?, rows: [obj] }] }
+//   columns  optional explicit column order; otherwise the union of the rows' keys, in first-
+//            seen order. rows are plain objects; every value is stringified for the cell.
+// Returns { filename, mime, b64 } — base64 so it rides back in JSON and the client rebuilds a
+// Blob. Not user-scoped: it transforms exactly what it is given and stores nothing.
+function exportColumns(sheet: any): string[] {
+    if (Array.isArray(sheet.columns) && sheet.columns.length) return sheet.columns.map((c: any) => '' + c);
+    const seen: string[] = [];
+    for (const r of (sheet.rows || [])) {
+        if (r && typeof r === 'object') for (const k of Object.keys(r)) if (seen.indexOf(k) < 0) seen.push(k);
+    }
+    return seen;
+}
+function exportCell(v: any): string {
+    if (v == null) return '';
+    if (typeof v === 'object') { try { return JSON.stringify(v); } catch { return '' + v; } }
+    return '' + v;
+}
+app.post('/export-table', async (req, res) => {
+    try {
+        const format = ('' + (req.body?.format || '')).toLowerCase();
+        let filename = ('' + (req.body?.filename || 'download')).replace(/[^A-Za-z0-9_\-. ]+/g, '_').trim() || 'download';
+        const title = ('' + (req.body?.title || '')).slice(0, 200);
+        let sheets = Array.isArray(req.body?.sheets) ? req.body.sheets : [];
+        sheets = sheets.filter((sh: any) => sh && Array.isArray(sh.rows)).slice(0, 100);
+        if (!sheets.length) return res.status(400).json({ error: 'Nothing to export.' });
+
+        if (format === 'xlsx') {
+            const data = sheets.map((sh: any, i: number) => {
+                const cols = exportColumns(sh);
+                const body = (sh.rows || []).map((r: any) => cols.map((c) => exportCell(r ? r[c] : '')));
+                const name = ('' + (sh.name || ('Sheet' + (i + 1)))).replace(/[\\/?*\[\]:]/g, ' ').slice(0, 31) || ('Sheet' + (i + 1));
+                return { name, data: [cols].concat(body) };
+            });
+            const buf = xlsx.build(data);
+            if (!/\.xlsx$/i.test(filename)) filename += '.xlsx';
+            return res.json({ filename, mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', b64: Buffer.from(buf).toString('base64') });
+        }
+
+        if (format === 'pdf') {
+            const doc = await PDFDocument.create();
+            const font = await doc.embedFont(StandardFonts.Helvetica);
+            const bold = await doc.embedFont(StandardFonts.HelveticaBold);
+            const margin = 40, size = 9, lh = 12.5;
+            const pageW = 612, pageH = 792, top = pageH - margin, bottomLimit = margin;
+            let page = doc.addPage([pageW, pageH]);
+            let y = top;
+            const clip = (t: string, max: number) => {
+                let out = '' + t; const maxChars = Math.floor(max / (size * 0.52));
+                if (out.length > maxChars) out = out.slice(0, Math.max(1, maxChars - 1)) + '…';
+                // Helvetica cannot encode every code point; keep it to printable ASCII plus the ellipsis.
+                return out.replace(/[^\x20-\x7e…]/g, '?');
+            };
+            const line = (text: string, f: any, sz: number, indent = 0) => {
+                if (y < bottomLimit) { page = doc.addPage([pageW, pageH]); y = top; }
+                page.drawText(clip(text, pageW - margin * 2 - indent), { x: margin + indent, y, size: sz, font: f });
+                y -= (sz + 3.5);
+            };
+            if (title) { line(title, bold, 15); y -= 4; }
+            for (const sh of sheets) {
+                const cols = exportColumns(sh);
+                line((sh.name || 'Sheet') + '  (' + (sh.rows || []).length + ')', bold, 11);
+                y -= 2;
+                for (const r of (sh.rows || [])) {
+                    if (y < bottomLimit + lh * 2) { page = doc.addPage([pageW, pageH]); y = top; }
+                    for (const c of cols) {
+                        const v = exportCell(r ? r[c] : '');
+                        if (v === '') continue;
+                        line(c + ': ' + v, font, size, 10);
+                    }
+                    y -= 5; // gap between records
+                }
+                y -= 8;
+            }
+            const bytes = await doc.save();
+            if (!/\.pdf$/i.test(filename)) filename += '.pdf';
+            return res.json({ filename, mime: 'application/pdf', b64: Buffer.from(bytes).toString('base64') });
+        }
+
+        return res.status(400).json({ error: 'Unknown format: ' + format });
+    } catch (e: any) {
+        console.error('[export-table] failed:', e);
+        return res.status(500).json({ error: String((e && e.message) || e) });
+    }
+});
+
 app.post('/get-dev-script', async (req, res) => {
     console.log(req.body);
     let ppath = req.body.spath
