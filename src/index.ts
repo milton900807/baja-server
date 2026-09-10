@@ -6696,6 +6696,12 @@ app.get('/script', async (req, res) => {
 // oligodesigner.com/s/<code> instead of /app/manchester/viewer?path=<long hex>.
 const SHARE_ALIAS_FILE = path.join(userData, 'share-aliases.json');
 
+// The Graph mailer is built near the bottom of this file inside a try block (the
+// credentials may be absent on a dev box). It parks itself here so an endpoint defined
+// earlier in the file can send mail; null means "no mail on this box", and every caller
+// treats that as a non-fatal condition -- the link is still shown to the sharer.
+let __bajaMailer: ((m: { to: string; subject: string; text: string; html?: string }) => Promise<void>) | null = null;
+
 // ---------------------------------------------------------------------------------------
 // FREE-TIER METERING
 //
@@ -7008,7 +7014,7 @@ app.post('/share-alias', (req, res) => {
             if (map[code] === p) return res.json({ code });
         }
         let code = genShareCode();
-        while (map[code]) code = genShareCode();
+        while (map[code] || loadPersonShares()[code]) code = genShareCode();
         map[code] = p;
         saveShareAliases();
         return res.json({ code });
@@ -7036,6 +7042,12 @@ app.get('/s/:code', (req, res) => {
     try {
         const map = loadShareAliases();
         const code = String(req.params.code || '');
+        // A share addressed to a PERSON opens in the editor, behind sign-in. The free
+        // editor route is used on purpose: it is the one /app route the auth guard does not
+        // gate, so the editor itself can send a signed-out recipient to the free sign-in
+        // page (/login?free=1) and bring them back here afterwards. A subscriber who lands
+        // on it gets the same editor; the shell clears the free flag on its next check.
+        if (loadPersonShares()[code]) return res.redirect(302, '/app/free/editor?share=' + encodeURIComponent(code));
         if (!map[code]) return res.status(404).send('This share link was not found.');
         return res.redirect(302, '/app/manchester/viewer?s=' + encodeURIComponent(code));
     } catch (e) {
@@ -7053,6 +7065,218 @@ app.get('/share-resolve', (req, res) => {
         return res.json({ path: target });
     } catch (e) {
         return res.status(404).json({ error: 'not found' });
+    }
+});
+
+// ---- Share a design WITH A PERSON ------------------------------------------------------
+//
+// The public share above gives anyone with the link a read-only view. This one is addressed:
+// the owner names an email address, the design is copied into a folder only that address may
+// read, and a short link (/s/<code>) opens it IN THE EDITOR for that person once they have
+// signed in. Someone without an account is taken through the free sign-in, the same one the
+// front page offers, and lands on the design afterwards.
+//
+// Storage, all under the user drive so the existing access rules apply unchanged:
+//
+//   <owner>/shared/<code>/<name>.baja   the snapshot of the design at the time of sharing
+//   <owner>/shared/<code>/.share        the recipient's address -- what /load-file checks
+//   <recipient>/shared_with_me/<owner>/<code>/<name>.baja
+//                                       a pointer { shared_from } so the design shows up in
+//                                       the recipient's own files (same layout processShares
+//                                       writes, so the periodic job and this agree)
+//   person-shares.json                  code -> { owner, to, name, path, ... }
+//
+// One code per (owner, recipient, design name): sharing the same design with the same
+// person again refreshes the snapshot and keeps the link they already have.
+const PERSON_SHARE_FILE = path.join(userData, 'person-shares.json');
+type PersonShare = { code: string; owner: string; to: string; name: string; path: string; message: string; created: number; updated: number };
+let __personShares: { [code: string]: PersonShare } | null = null;
+function loadPersonShares(): { [code: string]: PersonShare } {
+    if (__personShares) return __personShares;
+    try { __personShares = JSON.parse(fs.readFileSync(PERSON_SHARE_FILE, 'utf-8')) || {}; }
+    catch { __personShares = {}; }
+    return __personShares as { [code: string]: PersonShare };
+}
+function savePersonShares(): void {
+    try { fs.writeFileSync(PERSON_SHARE_FILE, JSON.stringify(__personShares || {}, null, 2)); }
+    catch (e) { console.error('person-share save failed:', e); }
+}
+function normEmail(v: any): string {
+    const s = ('' + (v == null ? '' : v)).trim().toLowerCase();
+    return isValidEmail(s) ? s : '';
+}
+// The design's file name, made safe for a path: same rule the public share applies.
+function shareFileName(name: any): string {
+    const base = ('' + (name || 'shared')).replace(/\.baja$/i, '').replace(/[^A-Za-z0-9_\- ]+/g, '_').trim() || 'shared';
+    return base + '.baja';
+}
+// Folder label for an owner inside shared_with_me -- the spelling processShares uses.
+function ownerFolderLabel(email: string): string { return email.replace(/[^a-zA-Z0-9]/g, '_'); }
+function personShareDir(rec: PersonShare): string { return path.join(userData, encodeEmail(rec.owner), 'shared', rec.code); }
+function personShareOrigin(req: any): string {
+    const host = ('' + (req.headers['x-forwarded-host'] || req.headers.host || 'oligodesigner.com')).split(',')[0].trim();
+    const proto = ('' + (req.headers['x-forwarded-proto'] || (host.startsWith('localhost') ? 'http' : 'https'))).split(',')[0].trim();
+    return proto + '://' + host;
+}
+// Add the recipient's address to the folder's .share unless it is already there. /load-file
+// compares the signed-in address to these lines as plain strings, so the spelling the client
+// sends (which may differ in case from what the owner typed) is added too when it arrives.
+function grantPersonShare(rec: PersonShare, spelling: string): void {
+    const f = path.join(personShareDir(rec), '.share');
+    let lines: string[] = [];
+    try { lines = fs.readFileSync(f, 'utf-8').split('\n').map((l: string) => l.trim()).filter(Boolean); } catch { lines = []; }
+    const want = [rec.to, ('' + (spelling || '')).trim()].filter(Boolean);
+    let changed = false;
+    for (const w of want) if (!lines.includes(w)) { lines.push(w); changed = true; }
+    if (changed || !fs.existsSync(f)) fs.writeFileSync(f, lines.join('\n') + '\n');
+}
+function writeRecipientPointer(rec: PersonShare): void {
+    try {
+        const dir = path.join(userData, encodeEmail(rec.to), 'shared_with_me', ownerFolderLabel(rec.owner), rec.code);
+        mkDirByPathSync(dir);
+        fs.writeFileSync(path.join(dir, rec.name), JSON.stringify({ shared_from: rec.path, shared_by: rec.owner }, null, 2), 'utf-8');
+    } catch (e) { console.error('[share-with] recipient pointer failed:', e); }
+}
+function personShareView(rec: PersonShare, req: any) {
+    return { code: rec.code, to: rec.to, name: rec.name, message: rec.message || '', created: rec.created, updated: rec.updated, url: personShareOrigin(req) + '/s/' + rec.code };
+}
+function shareEscapeHtml(v: any): string {
+    return ('' + (v == null ? '' : v)).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// Create or refresh a share. Body: { user (owner), to, name, value (serialized graph), message? }
+// Returns { code, url, to, name, mailed, mailError }.
+app.post('/share-with', async (req, res) => {
+    try {
+        const owner = normEmail(req.body?.user);
+        const to = normEmail(req.body?.to);
+        const value = req.body?.value;
+        if (!owner) return res.status(400).json({ error: 'You must be signed in to share a design.' });
+        if (!to) return res.status(400).json({ error: 'Enter the email address of the person to share with.' });
+        if (to === owner) return res.status(400).json({ error: 'That is your own address. Enter the address of the person you want to share with.' });
+        if (typeof value !== 'string' || !value.trim()) return res.status(400).json({ error: 'There is nothing on the canvas to share.' });
+        const name = shareFileName(req.body?.name);
+        const message = ('' + (req.body?.message || '')).trim().slice(0, 2000);
+
+        const map = loadPersonShares();
+        let rec: PersonShare | null = null;
+        for (const c of Object.keys(map)) {
+            const r = map[c];
+            if (r.owner === owner && r.to === to && r.name === name) { rec = r; break; }
+        }
+        const now = Date.now();
+        if (!rec) {
+            let code = genShareCode(7);
+            while (map[code] || loadShareAliases()[code]) code = genShareCode(7);
+            rec = { code, owner, to, name, path: '', message, created: now, updated: now };
+            map[code] = rec;
+        }
+        rec.message = message;
+        rec.updated = now;
+        const dir = personShareDir(rec);
+        mkDirByPathSync(dir);
+        fs.writeFileSync(path.join(dir, name), '' + value);
+        // Relative to the user drive with no leading slash: the shape processShares writes
+        // and the editor already follows (it adds the slash before /load-file).
+        rec.path = encodeEmail(owner) + '/shared/' + rec.code + '/' + name;
+        grantPersonShare(rec, to);
+        savePersonShares();
+        writeRecipientPointer(rec);
+
+        const url = personShareOrigin(req) + '/s/' + rec.code;
+        let mailed = false, mailError = '';
+        if (__bajaMailer) {
+            try {
+                const designLabel = name.replace(/\.baja$/i, '');
+                const note = message ? ('\n\n' + owner + ' wrote:\n' + message + '\n') : '';
+                await __bajaMailer({
+                    to,
+                    subject: owner + ' shared a design with you: ' + designLabel,
+                    text: owner + ' has shared the oligo design "' + designLabel + '" with you on Oligodesigner.\n\n'
+                        + 'Open it here: ' + url + '\n' + note
+                        + '\nThe link is for ' + to + '. If you do not have an account yet, sign in with the free option and the design will open once you are in.\n',
+                    html: '<div style="font-family:Segoe UI,system-ui,Arial,sans-serif;font-size:14px;color:#14202b;line-height:1.5;">'
+                        + '<p><b>' + shareEscapeHtml(owner) + '</b> has shared the oligo design <b>' + shareEscapeHtml(designLabel) + '</b> with you on Oligodesigner.</p>'
+                        + '<p><a href="' + shareEscapeHtml(url) + '" style="display:inline-block;padding:10px 18px;background:#12c2e0;color:#062430;text-decoration:none;border-radius:8px;font-weight:700;">Open the design</a></p>'
+                        + '<p style="font-size:12px;color:#5b6b78;">Or paste this link into your browser: ' + shareEscapeHtml(url) + '</p>'
+                        + (message ? ('<blockquote style="border-left:3px solid #d8e0e6;margin:12px 0;padding:6px 12px;color:#334;white-space:pre-wrap;">' + shareEscapeHtml(message) + '</blockquote>') : '')
+                        + '<p style="font-size:12px;color:#5b6b78;">This link is for ' + shareEscapeHtml(to) + '. If you do not have an account yet, sign in with the free option and the design will open once you are in.</p>'
+                        + '</div>'
+                });
+                mailed = true;
+            } catch (e: any) {
+                mailError = String((e && e.message) || e);
+                console.error('[share-with] mail failed:', mailError);
+            }
+        } else {
+            mailError = 'Mail is not configured on this server.';
+        }
+        console.log('[share-with] ' + owner + ' -> ' + to + ' ' + name + ' code=' + rec.code + (mailed ? ' mailed' : ' not mailed'));
+        return res.json({ ...personShareView(rec, req), mailed, mailError });
+    } catch (e: any) {
+        console.error('[share-with] failed:', e);
+        return res.status(500).json({ error: String((e && e.message) || e) });
+    }
+});
+
+// The shares an owner has made, optionally for one design name. Query: user, name?
+app.get('/share-with', (req, res) => {
+    try {
+        const owner = normEmail(req.query.user);
+        if (!owner) return res.status(400).json({ error: 'user required' });
+        const name = req.query.name ? shareFileName(req.query.name) : '';
+        const map = loadPersonShares();
+        const shares = Object.keys(map).map((c) => map[c])
+            .filter((r) => r.owner === owner && (!name || r.name === name))
+            .sort((a, b) => b.updated - a.updated)
+            .map((r) => personShareView(r, req));
+        return res.json({ shares });
+    } catch (e: any) {
+        return res.status(500).json({ error: String((e && e.message) || e) });
+    }
+});
+
+// Take a share back. Body: { user (owner), code }. The snapshot folder and the recipient's
+// pointer go with it, so the link stops working and the design leaves their file list.
+app.post('/share-with/revoke', (req, res) => {
+    try {
+        const owner = normEmail(req.body?.user);
+        const code = ('' + (req.body?.code || '')).trim();
+        const map = loadPersonShares();
+        const rec = map[code];
+        if (!owner || !rec) return res.status(404).json({ error: 'Share not found.' });
+        if (rec.owner !== owner) return res.status(403).json({ error: 'Only the person who shared this design can revoke it.' });
+        try { fs.rmSync(personShareDir(rec), { recursive: true, force: true }); } catch (e) { }
+        try { fs.rmSync(path.join(userData, encodeEmail(rec.to), 'shared_with_me', ownerFolderLabel(rec.owner), rec.code), { recursive: true, force: true }); } catch (e) { }
+        delete map[code];
+        savePersonShares();
+        return res.json({ revoked: code });
+    } catch (e: any) {
+        return res.status(500).json({ error: String((e && e.message) || e) });
+    }
+});
+
+// Resolve a code for the signed-in person. Query: code, user. Only the recipient (or the
+// owner) gets the path; anyone else is told the link was meant for someone else, without
+// being told for whom.
+app.get('/share-open', (req, res) => {
+    try {
+        const code = ('' + (req.query.code || '')).trim();
+        const raw = ('' + (req.query.user || '')).trim();
+        const user = normEmail(raw);
+        const rec = loadPersonShares()[code];
+        if (!rec) return res.status(404).json({ error: 'not_found', message: 'This share link was not found. It may have been revoked.' });
+        if (!user) return res.status(401).json({ error: 'sign_in', message: 'Sign in to open this design.' });
+        if (user !== rec.to && user !== rec.owner) {
+            return res.status(403).json({ error: 'not_recipient', message: 'This design was shared with a different email address. Sign in with the address the link was sent to.' });
+        }
+        if (user === rec.to) {
+            grantPersonShare(rec, raw);
+            writeRecipientPointer(rec);
+        }
+        return res.json({ code: rec.code, path: '/' + rec.path, name: rec.name, owner: rec.owner, message: rec.message || '', mine: user === rec.owner });
+    } catch (e: any) {
+        return res.status(500).json({ error: String((e && e.message) || e) });
     }
 });
 
@@ -12222,6 +12446,21 @@ try {
     }
 
 
+
+    // The share invite goes out from the configured sender, falling back to the address
+    // deploy/login-alert.js already sends from on this tenant.
+    const __mailFrom = userId || process.env.LOGIN_ALERT_FROM || 'milton@lajollalabs.com';
+    __bajaMailer = async (m) => {
+        const message = {
+            message: {
+                subject: m.subject,
+                body: m.html ? { contentType: 'HTML', content: m.html } : { contentType: 'Text', content: m.text },
+                toRecipients: [{ emailAddress: { address: m.to } }],
+            },
+            saveToSentItems: true,
+        };
+        await graphClient.api(`/users/${__mailFrom}/sendMail`).post(message);
+    };
 
     app.get('/test-mail', async (req, res) => {
         try {
