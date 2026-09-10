@@ -7181,7 +7181,12 @@ function shareFileName(name: any): string {
 // Folder label for an owner inside shared_with_me -- the spelling processShares uses.
 function ownerFolderLabel(email: string): string { return email.replace(/[^a-zA-Z0-9]/g, '_'); }
 function personShareDir(rec: PersonShare): string { return path.join(userData, encodeEmail(rec.owner), 'shared', rec.code); }
+// Where share links point. SHARE_LINK_ORIGIN pins it (production: https://gene.clinic,
+// which the same server answers for); without it the link uses whichever host the
+// sharer's request came in on.
+const SHARE_LINK_ORIGIN = ('' + (process.env.SHARE_LINK_ORIGIN || '')).trim().replace(/\/+$/, '');
 function personShareOrigin(req: any): string {
+    if (/^https?:\/\/[^\s/]+$/.test(SHARE_LINK_ORIGIN)) return SHARE_LINK_ORIGIN;
     const host = ('' + (req.headers['x-forwarded-host'] || req.headers.host || 'oligodesigner.com')).split(',')[0].trim();
     const proto = ('' + (req.headers['x-forwarded-proto'] || (host.startsWith('localhost') ? 'http' : 'https'))).split(',')[0].trim();
     return proto + '://' + host;
