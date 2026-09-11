@@ -7102,6 +7102,11 @@ app.get(['/library', '/library/:compound'], (req, res) => {
     return res.redirect(302, compound ? (base + '?compound=' + encodeURIComponent(compound)) : base);
 });
 
+// The PUBLIC IP viewer: the human genome with the patent (IP) landscape, no login. Redirects
+// into the auth-exempt Genome Viewer with ?ip=1, which hands off to the karyotype module in
+// its ipPublic mode (human genome, patents on, cut-down toolbar, per-chromosome bookmarks).
+app.get('/public/ip', (_req, res) => res.redirect(302, '/app/manchester/viewer?ip=1'));
+
 // Resolve a short code -> the view-only viewer, carrying only the CODE (never the
 // underlying path, which contains the owner's email) so nothing is exposed in the URL.
 app.get('/s/:code', (req, res) => {
