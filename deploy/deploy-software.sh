@@ -12,6 +12,12 @@
 #
 #  Usage:  ./deploy-software.sh [--no-build] [--skip-deps]
 #                               [--frontend-only|--backend-only] [--dry-run]
+#                               [--data <subdir>]...
+#
+#  --data <subdir>  ALSO push reference_data/<subdir> (additive, no --delete): a bundle
+#                   built on this machine that the server cannot build itself -- e.g.
+#                   `--data depmap` after py/bio/build-depmap-sl.py. Everything else in
+#                   reference_data stays untouched, as always.
 #  Env:    SERVER=ubuntu@52.87.30.101  SSH_KEY=~/.ssh/baja.pem  ./deploy-software.sh
 # =============================================================================
 set -euo pipefail
@@ -30,13 +36,15 @@ ROOT_DIR="$(cd "$SRV_DIR/.." && pwd)"
 WEB_DIR="$ROOT_DIR/baja"
 APPS_DIR="$ROOT_DIR/baja-apps"
 
-DO_BUILD=1; DO_DEPS=1; DRY=""; ONLY=""
+die_early(){ echo "$*" >&2; exit 2; }
+DO_BUILD=1; DO_DEPS=1; DRY=""; ONLY=""; DATA_DIRS=()
 while [[ $# -gt 0 ]]; do case "$1" in
   --no-build)      DO_BUILD=0 ;;
   --skip-deps)     DO_DEPS=0 ;;
   --frontend-only) ONLY="fe" ;;
   --backend-only)  ONLY="be" ;;
   --dry-run)       DRY="--dry-run" ;;
+  --data)          shift; [[ -n "${1:-}" ]] || die_early "--data needs a reference_data subdirectory"; DATA_DIRS+=("$1") ;;
   -h|--help)       sed -n '2,20p' "$0"; exit 0 ;;
   *) echo "unknown option: $1" >&2; exit 2 ;;
 esac; shift; done
@@ -143,6 +151,19 @@ if want_be; then
     c "Skipping server deps (--skip-deps)"
   fi
 fi
+
+# ---- reference-data bundles, only the ones asked for --------------------------
+# Additive and narrow: one subdirectory of reference_data at a time, never --delete, so
+# nothing the server built on its own is touched. This is the code-only script's one
+# concession to data, for bundles that are built here and merely copied there.
+for sub in "${DATA_DIRS[@]}"; do
+  src="$SRV_DIR/reference_data/$sub"
+  [[ -d "$src" ]] || die "no reference_data/$sub on this machine"
+  c "Syncing reference_data/$sub → $REMOTE_API/reference_data/$sub  (additive)"
+  [[ -n "$DRY" ]] || on_remote "mkdir -p '$REMOTE_API/reference_data/$sub'"
+  "${RSYNC[@]}" --exclude 'raw' --exclude '*.part' --exclude 'build.log' "$src/" "$SERVER:$REMOTE_API/reference_data/$sub/"
+  ok "reference_data/$sub synced"
+done
 
 # ---- restart + smoke --------------------------------------------------------
 if [[ -z "$DRY" ]]; then
