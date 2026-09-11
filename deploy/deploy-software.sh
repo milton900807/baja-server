@@ -7,6 +7,7 @@
 #    • frontend runtime config /eln/assets/env.js — preserved
 #    • reference_data / genomic data / userdata  — excluded
 #    • config dirs (config/, config.json), sample-data — excluded
+#    • geoblock rules/allow/enforce and the built network list — excluded
 #  Excluded paths are protected from --delete too, so they are neither
 #  overwritten nor removed.
 #
@@ -28,6 +29,8 @@ DOMAIN="${DOMAIN:-oligodesigner.com}"
 REMOTE_WEB="${REMOTE_WEB:-/eln}"
 REMOTE_API="${REMOTE_API:-/opt/baja-server}"
 REMOTE_APPS="${REMOTE_APPS:-/opt/baja-apps}"
+REMOTE_GEO="${REMOTE_GEO:-/opt/baja-geo}"                 # geo tools + DB-IP databases
+REMOTE_GEOBLOCK="${REMOTE_GEOBLOCK:-/etc/nginx/baja-geoblock}"   # nginx block plumbing
 RESTART_CMD="${RESTART_CMD:-sudo systemctl restart baja-server && sudo nginx -t && sudo systemctl reload nginx}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -143,6 +146,25 @@ if want_be; then
   c "Syncing lionscript modules under baja/**/data → $REMOTE_APPS"
   "${RSYNC[@]}" -m --include '*/' --include '*.js' --exclude '*' \
     "$APPS_DIR/baja/" "$SERVER:$REMOTE_APPS/baja/"
+
+  # ---- geoblock + traffic tools (deploy/geoblock) ---------------------------
+  # Two homes on the server, both owned by ubuntu so no sudo is needed:
+  #   /opt/baja-geo             the python/shell tools, beside the DB-IP .mmdb files
+  #   /etc/nginx/baja-geoblock  install-geoblock.sh and the geo-block template
+  # Additive and by explicit include list. The things NOT sent are the server's own:
+  # rules.json (what to block), allow.conf (exemptions), enforce.conf (the on/off
+  # switch -- `install-geoblock.sh disable` empties it), networks.conf (built from the
+  # databases), and the databases themselves. A --delete here would wipe the databases.
+  # A changed 00-baja-geoblock.conf only reaches nginx when install-geoblock.sh install
+  # copies it into conf.d again; the restart below reloads nginx but does not do that.
+  c "Syncing geo tools → $REMOTE_GEO  (databases preserved)"
+  "${RSYNC[@]}" --include 'build-geoblock.py' --include 'refresh-geo.sh' \
+    --include 'traffic-report.py' --include 'cities-csv.py' --include 'ip-activity.py' \
+    --exclude '*' "$HERE/geoblock/" "$SERVER:$REMOTE_GEO/"
+  c "Syncing geoblock plumbing → $REMOTE_GEOBLOCK  (rules, allow, enforce, networks preserved)"
+  "${RSYNC[@]}" --include 'install-geoblock.sh' --include '00-baja-geoblock.conf' \
+    --exclude '*' "$HERE/geoblock/" "$SERVER:$REMOTE_GEOBLOCK/"
+  ok "geoblock tools deployed"
 
   if [[ "$DO_DEPS" == 1 ]]; then
     c "Installing server deps (npm ci)…"      # full install — app needs the dev/transitive tree

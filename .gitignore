@@ -68,3 +68,7 @@ reference_data/*
 # before it is ever published. If it should be versioned, that is a deliberate act:
 #   git add -f deploy/env-prod.js
 deploy/env-prod.js
+
+# Per-IP traffic reports pulled from the server (visitor addresses and emails)
+deploy/geoblock/ip-activity-*.csv
+deploy/geoblock/ip-activity-*.json
