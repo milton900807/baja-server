@@ -7113,7 +7113,15 @@ app.get('/s/:code', (req, res) => {
         // gate, so the editor itself can send a signed-out recipient to the free sign-in
         // page (/login?free=1) and bring them back here afterwards. A subscriber who lands
         // on it gets the same editor; the shell clears the free flag on its next check.
-        if (loadPersonShares()[code]) return res.redirect(302, '/app/free/editor?share=' + encodeURIComponent(code));
+        const __pshare = loadPersonShares()[code];
+        if (__pshare) {
+            // A karyotype share opens in the Genome Viewer, which resolves ?share=<code> the
+            // same way the editor does; an oligo share opens in the free editor (the one /app
+            // route the auth guard leaves open so a signed-out recipient can be sent through
+            // the free sign-in).
+            if (/\.karyotype(\.json)?$/i.test('' + (__pshare.name || ''))) return res.redirect(302, '/app/manchester/karyotype?share=' + encodeURIComponent(code));
+            return res.redirect(302, '/app/free/editor?share=' + encodeURIComponent(code));
+        }
         if (!map[code]) return res.status(404).send('This share link was not found.');
         return res.redirect(302, '/app/manchester/viewer?s=' + encodeURIComponent(code));
     } catch (e) {
