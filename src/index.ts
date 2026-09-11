@@ -7463,7 +7463,8 @@ app.post('/export-table', async (req, res) => {
             if (title) { line(title, bold, 15); y -= 4; }
             for (const sh of sheets) {
                 const cols = exportColumns(sh);
-                line((sh.name || 'Sheet') + '  (' + (sh.rows || []).length + ')', bold, 11);
+                const images = Array.isArray(sh.images) ? sh.images.slice(0, 40) : [];
+                line((sh.name || 'Sheet') + ((sh.rows || []).length || !images.length ? '  (' + (sh.rows || []).length + ')' : ''), bold, 11);
                 y -= 2;
                 for (const r of (sh.rows || [])) {
                     if (y < bottomLimit + lh * 2) { page = doc.addPage([pageW, pageH]); y = top; }
@@ -7473,6 +7474,28 @@ app.post('/export-table', async (req, res) => {
                         line(c + ': ' + v, font, size, 10);
                     }
                     y -= 5; // gap between records
+                }
+                // PICTURES, after the records: [{ title, jpg_b64 | png_b64 }]. Each is scaled
+                // to the page width, moved to a fresh page when it would not fit, and its
+                // title set beneath it. A picture that cannot be decoded says so in place
+                // rather than failing the document.
+                for (const im of images) {
+                    try {
+                        const b64 = ('' + ((im && (im.jpg_b64 || im.png_b64)) || '')).replace(/^data:[^,]*,/, '');
+                        if (!b64) continue;
+                        const bytes = Buffer.from(b64, 'base64');
+                        const img = (im && im.jpg_b64) ? await doc.embedJpg(bytes) : await doc.embedPng(bytes);
+                        const maxW = pageW - margin * 2, maxH = pageH - margin * 2 - 40;
+                        const sc = Math.min(maxW / img.width, maxH / img.height, 1);
+                        const w = img.width * sc, h = img.height * sc;
+                        if (y - h - 24 < bottomLimit) { page = doc.addPage([pageW, pageH]); y = top; }
+                        page.drawImage(img, { x: margin, y: y - h, width: w, height: h });
+                        y -= h + 8;
+                        if (im && im.title) line('' + im.title, bold, 10);
+                        y -= 10;
+                    } catch (e) {
+                        line('(a picture could not be embedded)', font, size);
+                    }
                 }
                 y -= 8;
             }
