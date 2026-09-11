@@ -7183,8 +7183,13 @@ function normEmail(v: any): string {
 }
 // The design's file name, made safe for a path: same rule the public share applies.
 function shareFileName(name: any): string {
-    const base = ('' + (name || 'shared')).replace(/\.baja$/i, '').replace(/[^A-Za-z0-9_\- ]+/g, '_').trim() || 'shared';
-    return base + '.baja';
+    // Keep the extension that decides how a share opens: a .karyotype snapshot must stay a
+    // .karyotype (the Genome Viewer loads it and /s/<code> routes on it); everything else is
+    // an oligo screen and gets .baja. The base is sanitised either way.
+    const raw = ('' + (name || 'shared'));
+    const ext = /\.karyotype(\.json)?$/i.test(raw) ? '.karyotype' : '.baja';
+    const base = raw.replace(/\.karyotype(\.json)?$/i, '').replace(/\.baja$/i, '').replace(/[^A-Za-z0-9_\- ]+/g, '_').trim() || 'shared';
+    return base + ext;
 }
 // Folder label for an owner inside shared_with_me -- the spelling processShares uses.
 function ownerFolderLabel(email: string): string { return email.replace(/[^a-zA-Z0-9]/g, '_'); }
