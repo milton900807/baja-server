@@ -7464,7 +7464,11 @@ app.post('/export-table', async (req, res) => {
             for (const sh of sheets) {
                 const cols = exportColumns(sh);
                 const images = Array.isArray(sh.images) ? sh.images.slice(0, 40) : [];
-                line((sh.name || 'Sheet') + ((sh.rows || []).length || !images.length ? '  (' + (sh.rows || []).length + ')' : ''), bold, 11);
+                // The heading is the section's name and nothing else. It used to carry the
+                // record count in parentheses, which on a report whose sections are one
+                // record each -- a page per finding -- read as a stray index beside every
+                // title.
+                line('' + (sh.name || 'Sheet'), bold, 11);
                 y -= 2;
                 for (const r of (sh.rows || [])) {
                     if (y < bottomLimit + lh * 2) { page = doc.addPage([pageW, pageH]); y = top; }
