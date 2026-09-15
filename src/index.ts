@@ -6896,7 +6896,7 @@ const SHARE_ALIAS_FILE = path.join(userData, 'share-aliases.json');
 // credentials may be absent on a dev box). It parks itself here so an endpoint defined
 // earlier in the file can send mail; null means "no mail on this box", and every caller
 // treats that as a non-fatal condition -- the link is still shown to the sharer.
-let __bajaMailer: ((m: { to: string; subject: string; text: string; html?: string }) => Promise<void>) | null = null;
+let __bajaMailer: ((m: { to: string; subject: string; text: string; html?: string; fromName?: string }) => Promise<void>) | null = null;
 
 // HOW MAIL LEAVES THIS SERVER. Senders are tried in order and the first one that works is
 // remembered for the rest of the process:
@@ -6909,7 +6909,7 @@ let __bajaMailer: ((m: { to: string; subject: string; text: string; html?: strin
 //   2. Microsoft Graph, as each candidate mailbox in turn (set up further down, inside the
 //      try block that builds the Graph client). Kept as the fallback so an invite still
 //      goes out while the relay is not yet enabled.
-type MailMessage = { to: string; subject: string; text: string; html?: string };
+type MailMessage = { to: string; subject: string; text: string; html?: string; fromName?: string };
 type MailSender = { name: string; send: (m: MailMessage) => Promise<void> };
 const __mailSenders: MailSender[] = [];
 let __mailSenderInUse: MailSender | null = null;
@@ -6957,7 +6957,7 @@ if (SHARE_MAIL_FROM) {
                 const name = process.env.SMTP_EHLO_NAME || 'oligodesigner.com';
                 transport = nodemailer.createTransport({ host, port, name, secure: port === 465, requireTLS: true, connectionTimeout: 15000 });
             }
-            await transport.sendMail({ from: '"' + fromName.replace(/"/g, '') + '" <' + SHARE_MAIL_FROM + '>', to: m.to, subject: m.subject, text: m.text, html: m.html });
+            await transport.sendMail({ from: '"' + ('' + (m.fromName || fromName)).replace(/"/g, '') + '" <' + SHARE_MAIL_FROM + '>', to: m.to, subject: m.subject, text: m.text, html: m.html });
         }
     });
     installMailer();
@@ -7477,20 +7477,30 @@ app.post('/share-with', async (req, res) => {
         let mailed = false, mailError = '';
         if (__bajaMailer) {
             try {
-                const designLabel = name.replace(/\.baja$/i, '');
+                // A table workbook (.bjb) is shared from Analytics, which is Baja - Pedregal,
+                // not the oligo designer: the product name, the noun and the sender's display
+                // name follow the file kind.
+                const isWorkbook = /\.bjb$/i.test(name);
+                const product = isWorkbook ? (process.env.ANALYTICS_PRODUCT_NAME || 'Baja - Pedregal') : SHARE_PRODUCT_NAME;
+                const noun = isWorkbook ? 'workbook' : 'oligo design';
+                const thing = isWorkbook ? 'workbook' : 'design';
+                const designLabel = name.replace(/\.baja$/i, '').replace(/\.bjb$/i, '');
                 const note = message ? ('\n\n' + owner + ' wrote:\n' + message + '\n') : '';
                 await __bajaMailer({
                     to,
-                    subject: owner + ' shared a design with you: ' + designLabel,
-                    text: owner + ' has shared the oligo design "' + designLabel + '" with you on ' + SHARE_PRODUCT_NAME + '.\n\n'
+                    fromName: product,
+                    subject: owner + ' shared a ' + thing + ' with you: ' + designLabel,
+                    text: owner + ' has shared the ' + noun + ' "' + designLabel + '" with you on ' + product + '.\n\n'
                         + 'Open it here: ' + url + '\n' + note
-                        + '\nThe link is for ' + to + '. If you do not have an account yet, sign in with the free option and the design will open once you are in.\n',
+                        + (isWorkbook ? '\nYou will both be working on the same document: a table, timeline or chart can be edited by one person at a time, and you can see who has what.\n' : '')
+                        + '\nThe link is for ' + to + '. If you do not have an account yet, sign in with the free option and the ' + thing + ' will open once you are in.\n',
                     html: '<div style="font-family:Segoe UI,system-ui,Arial,sans-serif;font-size:14px;color:#14202b;line-height:1.5;">'
-                        + '<p><b>' + shareEscapeHtml(owner) + '</b> has shared the oligo design <b>' + shareEscapeHtml(designLabel) + '</b> with you on ' + shareEscapeHtml(SHARE_PRODUCT_NAME) + '.</p>'
-                        + '<p><a href="' + shareEscapeHtml(url) + '" style="display:inline-block;padding:10px 18px;background:#12c2e0;color:#062430;text-decoration:none;border-radius:8px;font-weight:700;">Open the design</a></p>'
+                        + '<p><b>' + shareEscapeHtml(owner) + '</b> has shared the ' + noun + ' <b>' + shareEscapeHtml(designLabel) + '</b> with you on ' + shareEscapeHtml(product) + '.</p>'
+                        + '<p><a href="' + shareEscapeHtml(url) + '" style="display:inline-block;padding:10px 18px;background:#12c2e0;color:#062430;text-decoration:none;border-radius:8px;font-weight:700;">Open the ' + thing + '</a></p>'
                         + '<p style="font-size:12px;color:#5b6b78;">Or paste this link into your browser: ' + shareEscapeHtml(url) + '</p>'
                         + (message ? ('<blockquote style="border-left:3px solid #d8e0e6;margin:12px 0;padding:6px 12px;color:#334;white-space:pre-wrap;">' + shareEscapeHtml(message) + '</blockquote>') : '')
-                        + '<p style="font-size:12px;color:#5b6b78;">This link is for ' + shareEscapeHtml(to) + '. If you do not have an account yet, sign in with the free option and the design will open once you are in.</p>'
+                        + (isWorkbook ? '<p style="font-size:12px;color:#5b6b78;">You will both be working on the same document: a table, timeline or chart can be edited by one person at a time, and you can see who has what.</p>' : '')
+                        + '<p style="font-size:12px;color:#5b6b78;">This link is for ' + shareEscapeHtml(to) + '. If you do not have an account yet, sign in with the free option and the ' + thing + ' will open once you are in.</p>'
                         + '</div>'
                 });
                 mailed = true;
