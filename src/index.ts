@@ -3929,6 +3929,202 @@ io.on('connection', (socket: any) => {
 });
 
 
+// ---- Document co-editing -----------------------------------------------------------------
+//
+// Two people can work on the same table workbook at once. The document is identified by its
+// path on the user drive (the owner's copy under <owner>/shared/<code>/ once it has been
+// shared with a person; /load-file's pointer-following means both sides load that path).
+//
+//   joinDoc          {path, user}                -> ack {ok, docId, locks, users}
+//   lockObject       {docId, objectId, label}    -> ack {ok, holder?}   one holder per object
+//   unlockObject     {docId, objectId}
+//   docObjectUpdate  {docId, objectId, kind, state}  rebroadcast to the others as docObjectUpdated
+//   leaveDoc         {docId}
+//   docState (server -> room) {docId, locks, users} after every change
+//
+// A lock is held by a socket; when that socket disconnects its locks go with it, so a closed
+// tab or a lost connection never leaves an object frozen. State is in memory: a server
+// restart clears locks, which the clients re-acquire on reconnect.
+type DocLock = { user: string; socketId: string; label: string; since: number };
+type DocSession = { locks: { [objectId: string]: DocLock }; members: { [socketId: string]: { user: string; since: number } } };
+const docSessions: { [docId: string]: DocSession } = {};
+
+// The same mapping /load-file applies to a client path: /myfiles/... is the caller's own
+// drive; anything else is spelled with the (encoded) owner already in it.
+function collabCanonicalPath(rawPath: any, user: string): string {
+    let c = '' + (rawPath || '');
+    if (!c) return '';
+    if (!c.startsWith('/')) c = '/' + c;
+    const key = getKey('user');
+    const puser = encodeEmail(user);
+    if (c.indexOf('/myfiles/') >= 0) c = c.replace('/myfiles/', '/' + puser + '/');
+    else c = c.replace('/user/', '/' + puser + '/');
+    c = (key + c).replace(/\/+/g, '/');
+    return c;
+}
+// Owner of the path, or someone the folder's .share names (or a public folder).
+function collabUserMayAccess(canon: string, user: string): boolean {
+    if (!canon || !user) return false;
+    try {
+        if (canon.indexOf(encodeEmail(user)) >= 0) return true;
+        const f = path.join(path.dirname(canon), '.share');
+        if (!fs.existsSync(f)) return false;
+        const lines = fs.readFileSync(f, 'utf-8').split('\n').map((l: string) => l.trim()).filter(Boolean);
+        return lines.includes('/public') || lines.includes(user) || lines.map((l: string) => l.toLowerCase()).includes(user.toLowerCase());
+    } catch { return false; }
+}
+// Documents are keyed by an opaque id derived from the canonical path, so the server's
+// filesystem layout never travels to the browser.
+function collabIdFor(canon: string): string {
+    return crypto.createHash('sha1').update(canon).digest('hex');
+}
+function collabSession(docId: string): DocSession {
+    if (!docSessions[docId]) docSessions[docId] = { locks: {}, members: {} };
+    return docSessions[docId];
+}
+function collabRoom(docId: string): string { return 'doc:' + docId; }
+function collabStateView(docId: string) {
+    const ses = collabSession(docId);
+    const locks: any = {};
+    for (const id of Object.keys(ses.locks)) locks[id] = { user: ses.locks[id].user, label: ses.locks[id].label, since: ses.locks[id].since };
+    const seen = new Set<string>();
+    const users: any[] = [];
+    for (const sid of Object.keys(ses.members)) {
+        const m = ses.members[sid];
+        if (seen.has(m.user)) continue;
+        seen.add(m.user);
+        users.push({ user: m.user, since: m.since });
+    }
+    return { docId, locks, users };
+}
+function collabBroadcast(docId: string): void {
+    try { io.to(collabRoom(docId)).emit('docState', collabStateView(docId)); } catch (e) { }
+}
+function collabReleaseSocket(docId: string, socketId: string): boolean {
+    const ses = docSessions[docId];
+    if (!ses) return false;
+    let changed = false;
+    for (const id of Object.keys(ses.locks)) {
+        if (ses.locks[id].socketId === socketId) { delete ses.locks[id]; changed = true; }
+    }
+    if (ses.members[socketId]) { delete ses.members[socketId]; changed = true; }
+    if (!Object.keys(ses.members).length && !Object.keys(ses.locks).length) delete docSessions[docId];
+    return changed;
+}
+
+io.on('connection', (socket: any) => {
+    socket.data = socket.data || {};
+    socket.data.docs = socket.data.docs || new Set<string>();
+
+    socket.on('joinDoc', (payload: any, ack: any) => {
+        try {
+            const user = normEmail(payload && payload.user);
+            const canon = collabCanonicalPath(payload && payload.path, user);
+            if (!user || !canon) { if (ack) ack({ ok: false, error: 'sign_in' }); return; }
+            if (!collabUserMayAccess(canon, user)) { if (ack) ack({ ok: false, error: 'no_access' }); return; }
+            const docId = collabIdFor(canon);
+            const ses = collabSession(docId);
+            ses.members[socket.id] = { user, since: Date.now() };
+            socket.data.docs.add(docId);
+            socket.join(collabRoom(docId));
+            if (ack) ack({ ok: true, ...collabStateView(docId) });
+            collabBroadcast(docId);
+            console.log('[collab] ' + user + ' joined ' + path.basename(canon));
+        } catch (e: any) {
+            if (ack) ack({ ok: false, error: String((e && e.message) || e) });
+        }
+    });
+
+    socket.on('leaveDoc', (payload: any) => {
+        const docId = '' + ((payload && payload.docId) || '');
+        if (!docId) return;
+        socket.leave(collabRoom(docId));
+        socket.data.docs.delete(docId);
+        if (collabReleaseSocket(docId, socket.id)) collabBroadcast(docId);
+    });
+
+    socket.on('lockObject', (payload: any, ack: any) => {
+        const docId = '' + ((payload && payload.docId) || '');
+        const objectId = '' + ((payload && payload.objectId) || '');
+        const ses = docSessions[docId];
+        const me = ses && ses.members[socket.id];
+        if (!ses || !me || !objectId) { if (ack) ack({ ok: false, error: 'not_joined' }); return; }
+        const cur = ses.locks[objectId];
+        if (cur && cur.user !== me.user && ses.members[cur.socketId]) {
+            if (ack) ack({ ok: false, holder: { user: cur.user, label: cur.label, since: cur.since } });
+            return;
+        }
+        ses.locks[objectId] = { user: me.user, socketId: socket.id, label: '' + ((payload && payload.label) || ''), since: (cur && cur.user === me.user) ? cur.since : Date.now() };
+        if (ack) ack({ ok: true });
+        collabBroadcast(docId);
+    });
+
+    socket.on('unlockObject', (payload: any) => {
+        const docId = '' + ((payload && payload.docId) || '');
+        const objectId = '' + ((payload && payload.objectId) || '');
+        const ses = docSessions[docId];
+        const me = ses && ses.members[socket.id];
+        if (!ses || !me) return;
+        const cur = ses.locks[objectId];
+        if (cur && cur.user === me.user) { delete ses.locks[objectId]; collabBroadcast(docId); }
+    });
+
+    socket.on('docObjectUpdate', (payload: any) => {
+        const docId = '' + ((payload && payload.docId) || '');
+        const objectId = '' + ((payload && payload.objectId) || '');
+        const ses = docSessions[docId];
+        const me = ses && ses.members[socket.id];
+        if (!ses || !me || !objectId) return;
+        const cur = ses.locks[objectId];
+        // Only the holder may change a locked object; an unlocked object may be changed by
+        // anyone with access (e.g. a removal, or a table nobody has picked up).
+        if (cur && cur.user !== me.user && ses.members[cur.socketId]) return;
+        socket.to(collabRoom(docId)).emit('docObjectUpdated', {
+            docId, objectId, kind: '' + ((payload && payload.kind) || 'plate'), state: payload.state, user: me.user, at: Date.now()
+        });
+    });
+
+    socket.on('disconnect', () => {
+        try {
+            for (const docId of Array.from(socket.data.docs as Set<string>)) {
+                if (collabReleaseSocket(docId, socket.id)) collabBroadcast(docId);
+            }
+        } catch (e) { }
+    });
+});
+
+// Save the document at its shared path. Body: { user, path, value }. The owner, and anyone
+// the folder's .share names, may write it; the room is told so the others can reload or
+// simply know the file on disk now matches what they see.
+app.post('/collab/save', (req, res) => {
+    try {
+        const user = normEmail(req.body && req.body.user);
+        const canon = collabCanonicalPath(req.body && req.body.path, user);
+        const value = req.body && req.body.value;
+        if (!user || !canon) return res.status(400).json({ error: 'sign in and name the document' });
+        if (!collabUserMayAccess(canon, user)) return res.status(403).json({ error: 'You do not have access to this document.' });
+        if (typeof value !== 'string' || !value.trim()) return res.status(400).json({ error: 'nothing to save' });
+        mkDirByPathSync(path.dirname(canon));
+        fs.writeFileSync(canon, value);
+        try { const id = collabIdFor(canon); io.to(collabRoom(id)).emit('docSaved', { docId: id, user, at: Date.now() }); } catch (e) { }
+        return res.json({ status: 'saved', path: req.body.path });
+    } catch (e: any) {
+        return res.status(500).json({ error: String((e && e.message) || e) });
+    }
+});
+
+// Who is in a document and what is locked (for a page that has no socket yet).
+app.get('/collab/state', (req, res) => {
+    try {
+        const user = normEmail(req.query.user);
+        const canon = collabCanonicalPath(req.query.path, user);
+        if (!user || !canon || !collabUserMayAccess(canon, user)) return res.status(403).json({ error: 'no access' });
+        return res.json(collabStateView(collabIdFor(canon)));
+    } catch (e: any) {
+        return res.status(500).json({ error: String((e && e.message) || e) });
+    }
+});
+
 app.get('/deprecated_transcript/:id', (req, res) => {
     const transcriptId = req.params.id;
     const strippedId = stripDecimal(transcriptId);
@@ -7125,6 +7321,8 @@ app.get('/s/:code', (req, res) => {
             // route the auth guard leaves open so a signed-out recipient can be sent through
             // the free sign-in).
             if (/\.karyotype(\.json)?$/i.test('' + (__pshare.name || ''))) return res.redirect(302, '/app/manchester/karyotype?share=' + encodeURIComponent(code));
+            // A table workbook opens in Analytics, where the recipient co-edits it live.
+            if (/\.bjb$/i.test('' + (__pshare.name || ''))) return res.redirect(302, '/app/cpd/baja-analytics?share=' + encodeURIComponent(code));
             return res.redirect(302, '/app/free/editor?share=' + encodeURIComponent(code));
         }
         if (!map[code]) return res.status(404).send('This share link was not found.');
@@ -7192,8 +7390,9 @@ function shareFileName(name: any): string {
     // .karyotype (the Genome Viewer loads it and /s/<code> routes on it); everything else is
     // an oligo screen and gets .baja. The base is sanitised either way.
     const raw = ('' + (name || 'shared'));
-    const ext = /\.karyotype(\.json)?$/i.test(raw) ? '.karyotype' : '.baja';
-    const base = raw.replace(/\.karyotype(\.json)?$/i, '').replace(/\.baja$/i, '').replace(/[^A-Za-z0-9_\- ]+/g, '_').trim() || 'shared';
+    // A .bjb (table workbook) share keeps its extension so it opens in Analytics.
+    const ext = /\.karyotype(\.json)?$/i.test(raw) ? '.karyotype' : (/\.bjb$/i.test(raw) ? '.bjb' : '.baja');
+    const base = raw.replace(/\.karyotype(\.json)?$/i, '').replace(/\.baja$/i, '').replace(/\.bjb$/i, '').replace(/[^A-Za-z0-9_\- ]+/g, '_').trim() || 'shared';
     return base + ext;
 }
 // Folder label for an owner inside shared_with_me -- the spelling processShares uses.
@@ -7229,7 +7428,7 @@ function writeRecipientPointer(rec: PersonShare): void {
     } catch (e) { console.error('[share-with] recipient pointer failed:', e); }
 }
 function personShareView(rec: PersonShare, req: any) {
-    return { code: rec.code, to: rec.to, name: rec.name, message: rec.message || '', created: rec.created, updated: rec.updated, url: personShareOrigin(req) + '/s/' + rec.code };
+    return { code: rec.code, to: rec.to, name: rec.name, path: '/' + rec.path, message: rec.message || '', created: rec.created, updated: rec.updated, url: personShareOrigin(req) + '/s/' + rec.code };
 }
 function shareEscapeHtml(v: any): string {
     return ('' + (v == null ? '' : v)).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');

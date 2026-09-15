@@ -112,6 +112,7 @@ def path_of(req):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=0)
+    ap.add_argument("--hours", type=float, default=0.0)
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--exclude", action="append", default=[])
     ap.add_argument("--min-requests", type=int, default=1)
@@ -127,7 +128,13 @@ def main():
     args = ap.parse_args()
 
     excluded = set(args.exclude) | (set() if args.all else EXCLUDE_DEFAULT)
-    since = datetime.now(timezone.utc) - timedelta(days=args.days) if args.days > 0 else None
+    # --hours is finer than --days; either sets the window, --hours wins when both given.
+    if args.hours > 0:
+        since = datetime.now(timezone.utc) - timedelta(hours=args.hours)
+    elif args.days > 0:
+        since = datetime.now(timezone.utc) - timedelta(days=args.days)
+    else:
+        since = None
     locate = open_geo()
 
     rows = {}
