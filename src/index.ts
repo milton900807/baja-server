@@ -1393,11 +1393,11 @@ function pyRelease(): void {
 // exec path is rebuilt from `new URL(path).pathname`, which drops any query string, so there
 // is nowhere to carry an id out to the browser and back. The user scopes it so one person's
 // cancel cannot reach into another's run.
-type PyJob = { id: string; proc: any; script: string; user: string; startedAt: number };
+type PyJob = { id: string; proc: any; script: string; user: string; startedAt: number; out: string };
 const __pyJobs = new Map<string, PyJob>();
 let __pyJobSeq = 0;
 
-function __pyJobRegister(proc: any, meta: { script?: string; user?: string }): string {
+function __pyJobRegister(proc: any, meta: { script?: string; user?: string; out?: string }): string {
     const id = 'job' + (++__pyJobSeq) + '-' + Date.now().toString(36);
     __pyJobs.set(id, {
         id,
@@ -1405,6 +1405,7 @@ function __pyJobRegister(proc: any, meta: { script?: string; user?: string }): s
         script: ('' + (meta && meta.script || '')).trim(),
         user: ('' + (meta && meta.user || '')).trim().toLowerCase(),
         startedAt: Date.now(),
+        out: ('' + (meta && meta.out || '')),
     });
     const drop = () => { try { __pyJobs.delete(id); } catch { } };
     try { proc.on('close', drop); proc.on('error', drop); } catch { }
@@ -1413,7 +1414,7 @@ function __pyJobRegister(proc: any, meta: { script?: string; user?: string }): s
 
 // Acquire a slot, spawn python, and guarantee the slot is released on close/error
 // or after a hard runtime cap (kills a hung job so it can't hold a slot forever).
-async function spawnPythonGated(args: string[], opts: any, meta?: { script?: string; user?: string }): Promise<any> {
+async function spawnPythonGated(args: string[], opts: any, meta?: { script?: string; user?: string; out?: string }): Promise<any> {
     await pyAcquire();
     let released = false;
     const release = () => { if (!released) { released = true; pyRelease(); } };
@@ -1431,6 +1432,61 @@ async function spawnPythonGated(args: string[], opts: any, meta?: { script?: str
     proc.on("close", () => { clearTimeout(killT); release(); });
     proc.on("error", () => { clearTimeout(killT); release(); });
     return proc;
+}
+
+// ---- A job the server cannot finish must SAY so ---------------------------
+// The client learns a job's fate from its output file: it polls until an EXIT_CODE line.
+// When this process is restarted (a deploy, a crash) every child python dies with it and
+// the file is left without one, so the browser polled a file that would never change and
+// the work badge spun until its own cap -- which read as "the model never finished". So:
+//  - on SIGTERM/SIGINT, every registered job gets an error resolution and an EXIT_CODE
+//    appended before the process exits (the file outlives the process in /tmp);
+//  - a read of an output file that has no EXIT_CODE, belongs to no registered job, and
+//    has not changed for a while is treated as an orphan of a process that died without
+//    the chance to do that, and gets the same lines then.
+const PY_RESTART_MSG = 'The server was restarted while this job was running. Run it again.';
+function __pyAbandonTail(reason: string): string {
+    return '\nIONWORKS:RESOLUTION:\t' + JSON.stringify({ status: 'error', error: reason, where: 'server-restart' }) + '\nEXIT_CODE:-1\n';
+}
+function __pyAbandonAll(reason: string): number {
+    let n = 0;
+    __pyJobs.forEach((j) => {
+        if (j.out) {
+            try { fs.appendFileSync(j.out, __pyAbandonTail(reason)); n++; } catch (e) { }
+        }
+        try { j.proc.kill('SIGTERM'); } catch (e) { }
+    });
+    return n;
+}
+let __shuttingDown = false;
+for (const sig of ['SIGTERM', 'SIGINT'] as const) {
+    process.on(sig, () => {
+        if (__shuttingDown) return;
+        __shuttingDown = true;
+        let n = 0;
+        try { n = __pyAbandonAll(PY_RESTART_MSG); } catch (e) { }
+        console.log('[' + sig + '] shutting down; ' + n + ' running python job(s) told the client to run again');
+        process.exit(0);
+    });
+}
+const PY_ORPHAN_QUIET_MS = 20_000;
+function __pyOrphanTail(filePath: string, content: string): string {
+    try {
+        if (content.indexOf('EXIT_CODE:') >= 0) return '';
+        const tmpRoot = path.join(require('os').tmpdir(), 'foobar-');
+        if (!('' + filePath).startsWith(tmpRoot)) return '';
+        let registered = false;
+        __pyJobs.forEach((j) => { if (j.out && j.out === filePath) registered = true; });
+        if (registered) return '';
+        const st = fs.statSync(filePath);
+        if (Date.now() - st.mtimeMs < PY_ORPHAN_QUIET_MS) return '';
+        const tail = __pyAbandonTail(PY_RESTART_MSG);
+        fs.appendFileSync(filePath, tail);
+        console.warn('[py-orphan] ' + filePath + ' has no running job and no EXIT_CODE; marked as abandoned');
+        return tail;
+    } catch (e) {
+        return '';
+    }
 }
 
 // What is running right now. Useful on its own for seeing whether a cancel actually landed.
@@ -9596,7 +9652,7 @@ const ppath = async (req: {
         const pythonProcess = await spawnPythonGated(
             ["-u", pythonScriptPath, ...args],
             { env },
-            { script: '' + (req.path || ''), user: (() => { try { const q: any = (req as any).query || {}; return '' + (q.user || q.email || ''); } catch (e) { return ''; } })() }
+            { script: '' + (req.path || ''), user: (() => { try { const q: any = (req as any).query || {}; return '' + (q.user || q.email || ''); } catch (e) { return ''; } })(), out: filePath }
         );
 
         const outputFileStream = fs.createWriteStream(filePath, { flags: 'a' });
@@ -9750,7 +9806,7 @@ const post_ppath = async (req: { path: any; body: any; headers: { [x: string]: a
     const pythonProcess = await spawnPythonGated(
         ["-u", pythonScriptPath, ...args],
         { env },
-        { script: '' + ((req as any).path || ''), user: (() => { try { const b: any = (req as any).body || {}; return '' + (b.user || b.email || ''); } catch (e) { return ''; } })() }
+        { script: '' + ((req as any).path || ''), user: (() => { try { const b: any = (req as any).body || {}; return '' + (b.user || b.email || ''); } catch (e) { return ''; } })(), out: filePath.toString() }
     );
 
     const outputFileStream = fs.createWriteStream(filePath.toString(), { flags: 'a' });
@@ -9981,7 +10037,8 @@ const pyread = (req: any, res: any) => {
             return res.json({ 'msg': 'undefined file' })
 
         }
-        const lines = fs.readFileSync(t).toString()
+        let lines = fs.readFileSync(t).toString()
+        lines += __pyOrphanTail(t, lines);
         const l = []
         // console.log(t + ' ll-> : ' + lines.length)
         let index = 0;

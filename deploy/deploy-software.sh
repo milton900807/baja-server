@@ -19,6 +19,10 @@
 #                   built on this machine that the server cannot build itself -- e.g.
 #                   `--data depmap` after py/bio/build-depmap-sl.py. Everything else in
 #                   reference_data stays untouched, as always.
+#          --no-restart     push without restarting the API (lionscript-only changes;
+#                           the node service reads baja-apps from disk). A restart kills
+#                           users' running python jobs, so skip it when nothing in dist changed.
+#          --force-restart  restart at once instead of waiting for running python jobs.
 #  Env:    SERVER=ubuntu@52.87.30.101  SSH_KEY=~/.ssh/baja.pem  ./deploy-software.sh
 # =============================================================================
 set -euo pipefail
@@ -40,12 +44,14 @@ WEB_DIR="$ROOT_DIR/baja"
 APPS_DIR="$ROOT_DIR/baja-apps"
 
 die_early(){ echo "$*" >&2; exit 2; }
-DO_BUILD=1; DO_DEPS=1; DRY=""; ONLY=""; DATA_DIRS=()
+DO_BUILD=1; DO_DEPS=1; DRY=""; ONLY=""; DATA_DIRS=(); DO_RESTART=1; WAIT_IDLE=1
 while [[ $# -gt 0 ]]; do case "$1" in
   --no-build)      DO_BUILD=0 ;;
   --skip-deps)     DO_DEPS=0 ;;
   --frontend-only) ONLY="fe" ;;
   --backend-only)  ONLY="be" ;;
+  --no-restart)    DO_RESTART=0 ;;     # lionscript-only push: the node service reads it from disk
+  --force-restart) WAIT_IDLE=0 ;;      # restart even while users' python jobs are running
   --dry-run)       DRY="--dry-run" ;;
   --data)          shift; [[ -n "${1:-}" ]] || die_early "--data needs a reference_data subdirectory"; DATA_DIRS+=("$1") ;;
   -h|--help)       sed -n '2,20p' "$0"; exit 0 ;;
@@ -188,7 +194,34 @@ for sub in "${DATA_DIRS[@]}"; do
 done
 
 # ---- restart + smoke --------------------------------------------------------
-if [[ -z "$DRY" ]]; then
+if [[ -z "$DRY" && "$DO_RESTART" == 0 ]]; then
+  # Lionscript (baja-apps) is read from disk on every /get-script (cache TTL is 0 unless
+  # cache-ttl.txt says otherwise), so a push of scripts alone needs no restart -- and a
+  # restart is not free: it kills every python job users have running at that moment.
+  ok "Not restarting (--no-restart): scripts are live, the API keeps its current build"
+elif [[ -z "$DRY" ]]; then
+  # A RESTART KILLS RUNNING PYTHON JOBS. The node service spawns them as children and
+  # systemd stops the whole group, so a user mid-build (a Claude budget, an off-target
+  # search) loses the run. Wait for the box to go quiet first; --force-restart skips it.
+  if [[ "$WAIT_IDLE" == 1 ]]; then
+    c "Waiting for running python jobs to finish before restarting…"
+    __idle=0
+    for __w in $(seq 1 90); do              # up to 15 minutes, the server's own job cap
+      __jobs="$(curl -fsS --max-time 8 "https://$DOMAIN/py-jobs" 2>/dev/null || echo '')"
+      if [[ -z "$__jobs" ]]; then
+        warn "could not read https://$DOMAIN/py-jobs; restarting without waiting"; __idle=1; break
+      fi
+      __busy="$(printf '%s' "$__jobs" | python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin); j=d.get("jobs") or []
+    print(len(j)+int(d.get("queued") or 0)); print("\n".join(("  %s  %s  %ds" % (x.get("script"), x.get("user") or "-", int((x.get("ageMs") or 0)/1000))) for x in j))
+except Exception: print(0)' 2>/dev/null)"
+      if [[ "${__busy%%$'\n'*}" == 0 ]]; then __idle=1; break; fi
+      [[ "$__w" == 1 || $((__w % 6)) == 0 ]] && printf '  still running:\n%s\n' "${__busy#*$'\n'}"
+      sleep 10
+    done
+    [[ "$__idle" == 1 ]] || warn "python jobs still running after 15 minutes; restarting anyway (they are told to run again)"
+  fi
   c "Restarting services…"
   on_remote "$RESTART_CMD"
   ok "restarted"
