@@ -7368,7 +7368,18 @@ app.get('/share-resolve', (req, res) => {
 // The product name in the invite, the same one the sender's display name uses.
 const SHARE_PRODUCT_NAME = process.env.SHARE_MAIL_FROM_NAME || 'GeneTx Designer';
 const PERSON_SHARE_FILE = path.join(userData, 'person-shares.json');
-type PersonShare = { code: string; owner: string; to: string; name: string; path: string; message: string; created: number; updated: number };
+// A share can be narrowed to ONE object of the workbook (a table, a chart, a timeline, a
+// note): the recipient then sees only that object, maximized, while the whole workbook
+// still travels so formulas that reach other tables keep working.
+type ShareObject = { kind: string; id: string; label: string };
+type PersonShare = { code: string; owner: string; to: string; name: string; path: string; message: string; created: number; updated: number; object?: ShareObject | null };
+function shareObjectOf(v: any): ShareObject | null {
+    if (!v || typeof v !== 'object') return null;
+    const kind = ('' + (v.kind || '')).trim().toLowerCase();
+    const id = ('' + (v.id || '')).trim().slice(0, 120);
+    if (!id || !['plate', 'plot', 'glyph'].includes(kind)) return null;
+    return { kind, id, label: ('' + (v.label || '')).trim().slice(0, 80) };
+}
 let __personShares: { [code: string]: PersonShare } | null = null;
 function loadPersonShares(): { [code: string]: PersonShare } {
     if (__personShares) return __personShares;
@@ -7428,7 +7439,7 @@ function writeRecipientPointer(rec: PersonShare): void {
     } catch (e) { console.error('[share-with] recipient pointer failed:', e); }
 }
 function personShareView(rec: PersonShare, req: any) {
-    return { code: rec.code, to: rec.to, name: rec.name, path: '/' + rec.path, message: rec.message || '', created: rec.created, updated: rec.updated, url: personShareOrigin(req) + '/s/' + rec.code };
+    return { code: rec.code, to: rec.to, name: rec.name, path: '/' + rec.path, message: rec.message || '', created: rec.created, updated: rec.updated, url: personShareOrigin(req) + '/s/' + rec.code, object: rec.object || null };
 }
 function shareEscapeHtml(v: any): string {
     return ('' + (v == null ? '' : v)).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -7447,20 +7458,25 @@ app.post('/share-with', async (req, res) => {
         if (typeof value !== 'string' || !value.trim()) return res.status(400).json({ error: 'There is nothing on the canvas to share.' });
         const name = shareFileName(req.body?.name);
         const message = ('' + (req.body?.message || '')).trim().slice(0, 2000);
+        const object = shareObjectOf(req.body?.object);
 
         const map = loadPersonShares();
         let rec: PersonShare | null = null;
         for (const c of Object.keys(map)) {
             const r = map[c];
-            if (r.owner === owner && r.to === to && r.name === name) { rec = r; break; }
+            // A whole-workbook share and a single-object share of the same file are
+            // different shares (different links, different views).
+            const sameObject = (r.object ? r.object.id : '') === (object ? object.id : '');
+            if (r.owner === owner && r.to === to && r.name === name && sameObject) { rec = r; break; }
         }
         const now = Date.now();
         if (!rec) {
             let code = genShareCode(7);
             while (map[code] || loadShareAliases()[code]) code = genShareCode(7);
-            rec = { code, owner, to, name, path: '', message, created: now, updated: now };
+            rec = { code, owner, to, name, path: '', message, created: now, updated: now, object };
             map[code] = rec;
         }
+        rec.object = object;
         rec.message = message;
         rec.updated = now;
         const dir = personShareDir(rec);
@@ -7482,9 +7498,12 @@ app.post('/share-with', async (req, res) => {
                 // name follow the file kind.
                 const isWorkbook = /\.bjb$/i.test(name);
                 const product = isWorkbook ? (process.env.ANALYTICS_PRODUCT_NAME || 'Baja - Pedregal') : SHARE_PRODUCT_NAME;
-                const noun = isWorkbook ? 'workbook' : 'oligo design';
-                const thing = isWorkbook ? 'workbook' : 'design';
-                const designLabel = name.replace(/\.baja$/i, '').replace(/\.bjb$/i, '');
+                const objectNoun = object ? (object.kind === 'plot' ? 'chart' : object.kind === 'glyph' ? 'note' : 'table') : '';
+                const noun = object ? objectNoun : (isWorkbook ? 'workbook' : 'oligo design');
+                const thing = object ? objectNoun : (isWorkbook ? 'workbook' : 'design');
+                const designLabel = object
+                    ? ((object.label || objectNoun) + ' (from ' + name.replace(/\.bjb$/i, '') + ')')
+                    : name.replace(/\.baja$/i, '').replace(/\.bjb$/i, '');
                 const note = message ? ('\n\n' + owner + ' wrote:\n' + message + '\n') : '';
                 await __bajaMailer({
                     to,
@@ -7574,7 +7593,7 @@ app.get('/share-open', (req, res) => {
             grantPersonShare(rec, raw);
             writeRecipientPointer(rec);
         }
-        return res.json({ code: rec.code, path: '/' + rec.path, name: rec.name, owner: rec.owner, message: rec.message || '', mine: user === rec.owner });
+        return res.json({ code: rec.code, path: '/' + rec.path, name: rec.name, owner: rec.owner, message: rec.message || '', mine: user === rec.owner, object: rec.object || null });
     } catch (e: any) {
         return res.status(500).json({ error: String((e && e.message) || e) });
     }
