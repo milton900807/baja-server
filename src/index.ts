@@ -4002,7 +4002,7 @@ io.on('connection', (socket: any) => {
 // tab or a lost connection never leaves an object frozen. State is in memory: a server
 // restart clears locks, which the clients re-acquire on reconnect.
 type DocLock = { user: string; socketId: string; label: string; since: number };
-type DocSession = { locks: { [objectId: string]: DocLock }; members: { [socketId: string]: { user: string; since: number } } };
+type DocSession = { locks: { [objectId: string]: DocLock }; members: { [socketId: string]: { user: string; since: number; viewOnly?: boolean } } };
 const docSessions: { [docId: string]: DocSession } = {};
 
 // The same mapping /load-file applies to a client path: /myfiles/... is the caller's own
@@ -4028,6 +4028,22 @@ function collabUserMayAccess(canon: string, user: string): boolean {
         const lines = fs.readFileSync(f, 'utf-8').split('\n').map((l: string) => l.trim()).filter(Boolean);
         return lines.includes('/public') || lines.includes(user) || lines.map((l: string) => l.toLowerCase()).includes(user.toLowerCase());
     } catch { return false; }
+}
+// A recipient of a view-only share of this document: reads, but nothing is written or
+// broadcast for them (enforced here, whatever the client does).
+function collabViewOnly(canon: string, user: string): boolean {
+    if (!canon || !user) return false;
+    try {
+        const key = getKey('user');
+        const map = loadPersonShares();
+        for (const c of Object.keys(map)) {
+            const r = map[c];
+            if (!r || r.access !== 'view' || r.to !== user || !r.path) continue;
+            const p = (key + '/' + r.path).replace(/\/+/g, '/');
+            if (p === canon) return true;
+        }
+    } catch { }
+    return false;
 }
 // Documents are keyed by an opaque id derived from the canonical path, so the server's
 // filesystem layout never travels to the browser.
@@ -4080,10 +4096,11 @@ io.on('connection', (socket: any) => {
             if (!collabUserMayAccess(canon, user)) { if (ack) ack({ ok: false, error: 'no_access' }); return; }
             const docId = collabIdFor(canon);
             const ses = collabSession(docId);
-            ses.members[socket.id] = { user, since: Date.now() };
+            const viewOnly = collabViewOnly(canon, user);
+            ses.members[socket.id] = { user, since: Date.now(), viewOnly };
             socket.data.docs.add(docId);
             socket.join(collabRoom(docId));
-            if (ack) ack({ ok: true, ...collabStateView(docId) });
+            if (ack) ack({ ok: true, viewOnly, ...collabStateView(docId) });
             collabBroadcast(docId);
             console.log('[collab] ' + user + ' joined ' + path.basename(canon));
         } catch (e: any) {
@@ -4105,6 +4122,7 @@ io.on('connection', (socket: any) => {
         const ses = docSessions[docId];
         const me = ses && ses.members[socket.id];
         if (!ses || !me || !objectId) { if (ack) ack({ ok: false, error: 'not_joined' }); return; }
+        if (me.viewOnly) { if (ack) ack({ ok: false, error: 'view_only' }); return; }
         const cur = ses.locks[objectId];
         if (cur && cur.user !== me.user && ses.members[cur.socketId]) {
             if (ack) ack({ ok: false, holder: { user: cur.user, label: cur.label, since: cur.since } });
@@ -4131,6 +4149,7 @@ io.on('connection', (socket: any) => {
         const ses = docSessions[docId];
         const me = ses && ses.members[socket.id];
         if (!ses || !me || !objectId) return;
+        if (me.viewOnly) return;     // a view-only recipient's changes go nowhere
         const cur = ses.locks[objectId];
         // Only the holder may change a locked object; an unlocked object may be changed by
         // anyone with access (e.g. a removal, or a table nobody has picked up).
@@ -4159,6 +4178,7 @@ app.post('/collab/save', (req, res) => {
         const value = req.body && req.body.value;
         if (!user || !canon) return res.status(400).json({ error: 'sign in and name the document' });
         if (!collabUserMayAccess(canon, user)) return res.status(403).json({ error: 'You do not have access to this document.' });
+        if (collabViewOnly(canon, user)) return res.status(403).json({ error: 'This document was shared with you view-only; changes are not saved.' });
         if (typeof value !== 'string' || !value.trim()) return res.status(400).json({ error: 'nothing to save' });
         mkDirByPathSync(path.dirname(canon));
         fs.writeFileSync(canon, value);
@@ -7428,7 +7448,7 @@ const PERSON_SHARE_FILE = path.join(userData, 'person-shares.json');
 // note): the recipient then sees only that object, maximized, while the whole workbook
 // still travels so formulas that reach other tables keep working.
 type ShareObject = { kind: string; id: string; label: string };
-type PersonShare = { code: string; owner: string; to: string; name: string; path: string; message: string; created: number; updated: number; object?: ShareObject | null };
+type PersonShare = { code: string; owner: string; to: string; name: string; path: string; message: string; created: number; updated: number; object?: ShareObject | null; access?: 'edit' | 'view' };
 function shareObjectOf(v: any): ShareObject | null {
     if (!v || typeof v !== 'object') return null;
     const kind = ('' + (v.kind || '')).trim().toLowerCase();
@@ -7515,7 +7535,8 @@ app.post('/share-with', async (req, res) => {
         const name = shareFileName(req.body?.name);
         const message = ('' + (req.body?.message || '')).trim().slice(0, 2000);
         const object = shareObjectOf(req.body?.object);
-
+        // 'view': the recipient may look and pan, and nothing they do is saved or broadcast.
+        const access: 'edit' | 'view' = (('' + (req.body?.access || 'edit')).toLowerCase() === 'view') ? 'view' : 'edit';
         const map = loadPersonShares();
         let rec: PersonShare | null = null;
         for (const c of Object.keys(map)) {
@@ -7533,6 +7554,7 @@ app.post('/share-with', async (req, res) => {
             map[code] = rec;
         }
         rec.object = object;
+        rec.access = access;
         rec.message = message;
         rec.updated = now;
         const dir = personShareDir(rec);
@@ -7649,7 +7671,7 @@ app.get('/share-open', (req, res) => {
             grantPersonShare(rec, raw);
             writeRecipientPointer(rec);
         }
-        return res.json({ code: rec.code, path: '/' + rec.path, name: rec.name, owner: rec.owner, message: rec.message || '', mine: user === rec.owner, object: rec.object || null });
+        return res.json({ code: rec.code, path: '/' + rec.path, name: rec.name, owner: rec.owner, message: rec.message || '', mine: user === rec.owner, object: rec.object || null, access: rec.access || 'edit' });
     } catch (e: any) {
         return res.status(500).json({ error: String((e && e.message) || e) });
     }
