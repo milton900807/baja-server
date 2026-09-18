@@ -7396,9 +7396,18 @@ app.get('/s/:code', (req, res) => {
             // same way the editor does; an oligo share opens in the free editor (the one /app
             // route the auth guard leaves open so a signed-out recipient can be sent through
             // the free sign-in).
+            // A public link opens in the viewer whatever the file is called (its home is /v/<code>).
+            if ((__pshare as any).access === 'public') return res.redirect(302, '/app/cpd/baja-analytics-viewer?share=' + encodeURIComponent(code));
             if (/\.karyotype(\.json)?$/i.test('' + (__pshare.name || ''))) return res.redirect(302, '/app/manchester/karyotype?share=' + encodeURIComponent(code));
-            // A table workbook opens in Analytics, where the recipient co-edits it live.
-            if (/\.bjb$/i.test('' + (__pshare.name || ''))) return res.redirect(302, '/app/cpd/baja-analytics?share=' + encodeURIComponent(code));
+            // A table workbook opens in Analytics, where the recipient co-edits it live. One
+            // timeline or chart shared VIEW ONLY opens in the viewer instead: the same app
+            // with the menubar, navigation and every editing gesture taken away.
+            if (/\.bjb$/i.test('' + (__pshare.name || ''))) {
+                const __obj: any = (__pshare as any).object;
+                if ((__pshare as any).access === 'public') return res.redirect(302, '/app/cpd/baja-analytics-viewer?share=' + encodeURIComponent(code));
+                if ((__pshare as any).access === 'view' && __obj && __obj.kind === 'plot') return res.redirect(302, '/app/cpd/baja-analytics-viewer?share=' + encodeURIComponent(code));
+                return res.redirect(302, '/app/cpd/baja-analytics?share=' + encodeURIComponent(code));
+            }
             return res.redirect(302, '/app/free/editor?share=' + encodeURIComponent(code));
         }
         if (!map[code]) return res.status(404).send('This share link was not found.');
@@ -7448,7 +7457,9 @@ const PERSON_SHARE_FILE = path.join(userData, 'person-shares.json');
 // note): the recipient then sees only that object, maximized, while the whole workbook
 // still travels so formulas that reach other tables keep working.
 type ShareObject = { kind: string; id: string; label: string };
-type PersonShare = { code: string; owner: string; to: string; name: string; path: string; message: string; created: number; updated: number; object?: ShareObject | null; access?: 'edit' | 'view' };
+// access 'public': anyone with the link, no sign-in, view only, opened in the viewer; `to` is
+// the literal 'public' and a preview.png next to the snapshot feeds the link's social card.
+type PersonShare = { code: string; owner: string; to: string; name: string; path: string; message: string; created: number; updated: number; object?: ShareObject | null; access?: 'edit' | 'view' | 'public'; preview?: boolean };
 function shareObjectOf(v: any): ShareObject | null {
     if (!v || typeof v !== 'object') return null;
     const kind = ('' + (v.kind || '')).trim().toLowerCase();
@@ -7514,8 +7525,12 @@ function writeRecipientPointer(rec: PersonShare): void {
         fs.writeFileSync(path.join(dir, rec.name), JSON.stringify({ shared_from: rec.path, shared_by: rec.owner }, null, 2), 'utf-8');
     } catch (e) { console.error('[share-with] recipient pointer failed:', e); }
 }
+function personShareUrl(rec: PersonShare, req: any): string {
+    // A public link goes through /v/<code>: the page that carries the social-card tags.
+    return personShareOrigin(req) + (rec.access === 'public' ? '/v/' : '/s/') + rec.code;
+}
 function personShareView(rec: PersonShare, req: any) {
-    return { code: rec.code, to: rec.to, name: rec.name, path: '/' + rec.path, message: rec.message || '', created: rec.created, updated: rec.updated, url: personShareOrigin(req) + '/s/' + rec.code, object: rec.object || null };
+    return { code: rec.code, to: rec.to, name: rec.name, path: '/' + rec.path, message: rec.message || '', created: rec.created, updated: rec.updated, url: personShareUrl(rec, req), object: rec.object || null, access: rec.access || 'edit', preview: !!rec.preview };
 }
 function shareEscapeHtml(v: any): string {
     return ('' + (v == null ? '' : v)).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -7526,17 +7541,25 @@ function shareEscapeHtml(v: any): string {
 app.post('/share-with', async (req, res) => {
     try {
         const owner = normEmail(req.body?.user);
-        const to = normEmail(req.body?.to);
         const value = req.body?.value;
+        // 'view': the recipient may look and pan, and nothing they do is saved or broadcast.
+        // 'public': no recipient at all -- anyone with the link opens it in the viewer, no sign-in.
+        const accessRaw = ('' + (req.body?.access || 'edit')).toLowerCase();
+        const access: 'edit' | 'view' | 'public' = accessRaw === 'view' ? 'view' : accessRaw === 'public' ? 'public' : 'edit';
+        const isPublic = access === 'public';
+        const to = isPublic ? 'public' : normEmail(req.body?.to);
         if (!owner) return res.status(400).json({ error: 'You must be signed in to share a design.' });
-        if (!to) return res.status(400).json({ error: 'Enter the email address of the person to share with.' });
-        if (to === owner) return res.status(400).json({ error: 'That is your own address. Enter the address of the person you want to share with.' });
+        if (!isPublic && !to) return res.status(400).json({ error: 'Enter the email address of the person to share with.' });
+        if (!isPublic && to === owner) return res.status(400).json({ error: 'That is your own address. Enter the address of the person you want to share with.' });
         if (typeof value !== 'string' || !value.trim()) return res.status(400).json({ error: 'There is nothing on the canvas to share.' });
         const name = shareFileName(req.body?.name);
         const message = ('' + (req.body?.message || '')).trim().slice(0, 2000);
         const object = shareObjectOf(req.body?.object);
-        // 'view': the recipient may look and pan, and nothing they do is saved or broadcast.
-        const access: 'edit' | 'view' = (('' + (req.body?.access || 'edit')).toLowerCase() === 'view') ? 'view' : 'edit';
+        if (isPublic && !object) return res.status(400).json({ error: 'A public link is for one timeline, chart or table. Share it from the object\'s own menu.' });
+        // The social card image, rendered by the author's browser: a PNG data URL, capped.
+        const previewRaw = ('' + (req.body?.preview || ''));
+        const previewB64 = /^data:image\/png;base64,/.test(previewRaw) ? previewRaw.slice(previewRaw.indexOf(',') + 1) : '';
+        if (previewB64.length > 6 * 1024 * 1024) return res.status(400).json({ error: 'The preview image is too large.' });
         const map = loadPersonShares();
         let rec: PersonShare | null = null;
         for (const c of Object.keys(map)) {
@@ -7563,6 +7586,13 @@ app.post('/share-with', async (req, res) => {
         // Relative to the user drive with no leading slash: the shape processShares writes
         // and the editor already follows (it adds the slash before /load-file).
         rec.path = encodeEmail(owner) + '/shared/' + rec.code + '/' + name;
+        if (isPublic) {
+            // No recipient to grant or point at. The preview lives next to the snapshot.
+            if (previewB64) { try { fs.writeFileSync(path.join(dir, 'preview.png'), Buffer.from(previewB64, 'base64')); rec.preview = true; } catch (e) { rec.preview = false; } }
+            savePersonShares();
+            console.log('[share-with] ' + owner + ' -> PUBLIC ' + name + ' code=' + rec.code + (rec.preview ? ' with preview' : ''));
+            return res.json({ ...personShareView(rec, req), mailed: false, mailError: '' });
+        }
         grantPersonShare(rec, to);
         savePersonShares();
         writeRecipientPointer(rec);
@@ -7571,11 +7601,11 @@ app.post('/share-with', async (req, res) => {
         let mailed = false, mailError = '';
         if (__bajaMailer) {
             try {
-                // A table workbook (.bjb) is shared from Analytics, which is Baja - Pedregal,
+                // A table workbook (.bjb) is shared from Analytics, which is Baja - Project,
                 // not the oligo designer: the product name, the noun and the sender's display
                 // name follow the file kind.
                 const isWorkbook = /\.bjb$/i.test(name);
-                const product = isWorkbook ? (process.env.ANALYTICS_PRODUCT_NAME || 'Baja - Pedregal') : SHARE_PRODUCT_NAME;
+                const product = isWorkbook ? (process.env.ANALYTICS_PRODUCT_NAME || 'Baja - Project') : SHARE_PRODUCT_NAME;
                 const objectNoun = object ? (object.kind === 'plot' ? 'chart' : object.kind === 'glyph' ? 'note' : 'table') : '';
                 const noun = object ? objectNoun : (isWorkbook ? 'workbook' : 'oligo design');
                 const thing = object ? objectNoun : (isWorkbook ? 'workbook' : 'design');
@@ -7653,6 +7683,71 @@ app.post('/share-with/revoke', (req, res) => {
     }
 });
 
+// ---- Public links ---------------------------------------------------------------------
+// A public share is read by anyone: the snapshot document (for the viewer), its preview
+// image (for the social card), and /v/<code>, the page a link post points at. That page
+// carries the Open Graph tags a crawler reads and sends a browser on to the viewer.
+function publicShareOf(code: string): PersonShare | null {
+    const rec = loadPersonShares()[('' + (code || '')).trim()];
+    return (rec && rec.access === 'public') ? rec : null;
+}
+app.get('/public-share', (req, res) => {
+    try {
+        const rec = publicShareOf('' + (req.query.code || ''));
+        if (!rec) return res.status(404).json({ error: 'not_found', msg: 'This public link was not found. It may have been taken down.' });
+        const file = path.join(personShareDir(rec), rec.name);
+        if (!fs.existsSync(file)) return res.status(404).json({ error: 'not_found', msg: 'This public link no longer has a document.' });
+        res.set('Cache-Control', 'no-cache');
+        const doc = JSON.parse(fs.readFileSync(file, 'utf-8'));
+        return res.json(doc);
+    } catch (e: any) {
+        return res.status(500).json({ error: String((e && e.message) || e) });
+    }
+});
+app.get('/v/:code/preview.png', (req, res) => {
+    try {
+        const rec = publicShareOf('' + (req.params.code || ''));
+        const file = rec ? path.join(personShareDir(rec), 'preview.png') : '';
+        if (!rec || !fs.existsSync(file)) return res.status(404).send('No preview.');
+        res.set('Cache-Control', 'public, max-age=300');
+        res.type('png');
+        return res.sendFile(path.resolve(file));
+    } catch (e: any) {
+        return res.status(500).send('error');
+    }
+});
+app.get('/v/:code', (req, res) => {
+    try {
+        const code = '' + (req.params.code || '');
+        const rec = publicShareOf(code);
+        if (!rec) return res.status(404).send('This public link was not found. It may have been taken down.');
+        const origin = personShareOrigin(req);
+        const obj: any = rec.object || {};
+        const noun = obj.kind === 'plot' ? 'timeline' : obj.kind === 'glyph' ? 'note' : 'table';
+        const title = shareEscapeHtml((obj.label || (rec.name || '').replace(/\.bjb$/i, '') || 'Shared ' + noun));
+        const desc = shareEscapeHtml(rec.message || ('A ' + noun + ' shared by ' + rec.owner.split('@')[0] + ' on Baja - Project. Drag to move through time.'));
+        const viewer = '/app/cpd/baja-analytics-viewer?share=' + encodeURIComponent(code);
+        const img = rec.preview ? (origin + '/v/' + encodeURIComponent(code) + '/preview.png') : '';
+        res.set('Cache-Control', 'no-cache');
+        res.type('html');
+        return res.send('<!doctype html><html lang="en"><head><meta charset="utf-8"><title>' + title + '</title>'
+            + '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            + '<meta name="description" content="' + desc + '">'
+            + '<meta property="og:type" content="website"><meta property="og:site_name" content="Baja - Project">'
+            + '<meta property="og:title" content="' + title + '"><meta property="og:description" content="' + desc + '">'
+            + '<meta property="og:url" content="' + shareEscapeHtml(origin + '/v/' + code) + '">'
+            + (img ? ('<meta property="og:image" content="' + shareEscapeHtml(img) + '"><meta property="og:image:width" content="1200"><meta property="og:image:height" content="630"><meta name="twitter:card" content="summary_large_image"><meta name="twitter:image" content="' + shareEscapeHtml(img) + '">') : '<meta name="twitter:card" content="summary">')
+            + '<meta name="twitter:title" content="' + title + '"><meta name="twitter:description" content="' + desc + '">'
+            + '<script>location.replace(' + JSON.stringify(viewer) + ');</script>'
+            + '</head><body style="font-family:system-ui,sans-serif;color:#0a2540;padding:24px;">'
+            + '<p><b>' + title + '</b></p><p>' + desc + '</p>'
+            + (img ? ('<p><img src="' + shareEscapeHtml(img) + '" alt="' + title + '" style="max-width:100%;border-radius:8px;"></p>') : '')
+            + '<p><a href="' + shareEscapeHtml(viewer) + '">Open the ' + noun + '</a></p></body></html>');
+    } catch (e: any) {
+        return res.status(500).send('error');
+    }
+});
+
 // Resolve a code for the signed-in person. Query: code, user. Only the recipient (or the
 // owner) gets the path; anyone else is told the link was meant for someone else, without
 // being told for whom.
@@ -7663,6 +7758,9 @@ app.get('/share-open', (req, res) => {
         const user = normEmail(raw);
         const rec = loadPersonShares()[code];
         if (!rec) return res.status(404).json({ error: 'not_found', message: 'This share link was not found. It may have been revoked.' });
+        if (rec.access === 'public') {
+            return res.json({ code: rec.code, path: '/' + rec.path, name: rec.name, owner: rec.owner, message: rec.message || '', mine: !!user && user === rec.owner, object: rec.object || null, access: 'public', public: true });
+        }
         if (!user) return res.status(401).json({ error: 'sign_in', message: 'Sign in to open this design.' });
         if (user !== rec.to && user !== rec.owner) {
             return res.status(403).json({ error: 'not_recipient', message: 'This design was shared with a different email address. Sign in with the address the link was sent to.' });
