@@ -8412,8 +8412,29 @@ app.post('/save-user-data', async (req, res) => {
     }
     if (type === 'autosave') {
         try {
-            { const refused = refuseEmptyOverwrite(ppath, value, req.body.allowEmpty); if (refused) return res.status(409).json({ status: refused, error: refused, refused: 'empty-overwrite' }); }
-            fs.writeFileSync(ppath, value);
+            // LOCKED TO THE CALLER'S OWN FOLDER. This branch used to write `value` to whatever
+            // path the request named, with no check of who was asking: any file the server
+            // process could reach. Now it needs a signed-in address, and the path is resolved
+            // inside that user's folder (the same folder the normal save below writes to: the
+            // encoded form of the same address string). Anything that resolves outside it --
+            // "..", an absolute path elsewhere, another user's folder -- is refused.
+            const rawUser = ('' + (req.body.user || '')).trim();
+            if (!normEmail(rawUser)) return res.status(401).json({ status: 'Autosave refused: sign in first.', error: 'sign_in' });
+            const root = path.resolve(userData, encodeEmail(rawUser));
+            let rel = ('' + (ppath || '')).trim();
+            const userDataAbs = path.resolve(userData);
+            if (rel === userDataAbs || rel.startsWith(userDataAbs + '/')) rel = rel.slice(userDataAbs.length);
+            rel = rel.replace(/^\/+/, '');
+            const own = encodeEmail(rawUser);
+            if (rel === own || rel.startsWith(own + '/')) rel = rel.slice(own.length).replace(/^\/+/, '');
+            const target = path.resolve(root, rel);
+            if (!rel || target === root || !target.startsWith(root + path.sep)) {
+                console.warn('[save-user-data] autosave refused outside the caller\'s folder:', JSON.stringify(ppath));
+                return res.status(403).json({ status: 'Autosave refused: that path is outside your files.', error: 'forbidden' });
+            }
+            { const refused = refuseEmptyOverwrite(target, value, req.body.allowEmpty); if (refused) return res.status(409).json({ status: refused, error: refused, refused: 'empty-overwrite' }); }
+            mkDirByPathSync(path.dirname(target));
+            fs.writeFileSync(target, value);
             return res.status(400).json({ status: 'Autosave' });
 
         } catch (exception) {
