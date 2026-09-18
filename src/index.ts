@@ -4171,6 +4171,37 @@ io.on('connection', (socket: any) => {
 // Save the document at its shared path. Body: { user, path, value }. The owner, and anyone
 // the folder's .share names, may write it; the room is told so the others can reload or
 // simply know the file on disk now matches what they see.
+// ---- Never overwrite a workbook with an empty one ------------------------------------------
+// A tab that had one workbook open, then cleared its canvas (File > New) with the live session
+// still joined to the first file, saved the empty canvas over it: sptlc2.bjb, 2026-09-18. The
+// client now detaches first, but the server is the last line: a save that would replace a
+// workbook that has tables, charts or notes with one that has none is refused, unless the
+// caller says outright that emptying it is intended (allowEmpty).
+function workbookItemCount(text: string): number | null {
+    try {
+        const d = JSON.parse(text);
+        if (!d || typeof d !== 'object') return null;
+        const pt = (d as any).plateTrack;
+        if (!pt || typeof pt !== 'object') return null;
+        const n = (a: any) => (Array.isArray(a) ? a.length : 0);
+        return n(pt.root) + n(pt.m_plots) + n(pt.glyphs) + n((d as any).track);
+    } catch { return null; }
+}
+function refuseEmptyOverwrite(file: string, value: any, allowEmpty: any): string | null {
+    try {
+        if (allowEmpty === true || allowEmpty === 'true') return null;
+        if (!/\.(bjb|bajabio)$/i.test('' + file)) return null;
+        if (typeof value !== 'string') return null;
+        const incoming = workbookItemCount(value);
+        if (incoming === null || incoming > 0) return null;
+        if (!fs.existsSync(file)) return null;
+        const existing = workbookItemCount(fs.readFileSync(file, 'utf-8'));
+        if (!existing) return null;
+        console.warn('[save guard] refused an empty save over ' + file + ' (' + existing + ' items on disk)');
+        return 'Not saved: this would replace "' + path.basename(file) + '" (' + existing + ' tables, charts and notes) with an empty workbook. Reopen that file, or save this canvas under a new name.';
+    } catch (e) { return null; }
+}
+
 app.post('/collab/save', (req, res) => {
     try {
         const user = normEmail(req.body && req.body.user);
@@ -4180,6 +4211,7 @@ app.post('/collab/save', (req, res) => {
         if (!collabUserMayAccess(canon, user)) return res.status(403).json({ error: 'You do not have access to this document.' });
         if (collabViewOnly(canon, user)) return res.status(403).json({ error: 'This document was shared with you view-only; changes are not saved.' });
         if (typeof value !== 'string' || !value.trim()) return res.status(400).json({ error: 'nothing to save' });
+        { const refused = refuseEmptyOverwrite(canon, value, req.body && req.body.allowEmpty); if (refused) return res.status(409).json({ error: refused, refused: 'empty-overwrite' }); }
         mkDirByPathSync(path.dirname(canon));
         fs.writeFileSync(canon, value);
         try { const id = collabIdFor(canon); io.to(collabRoom(id)).emit('docSaved', { docId: id, user, at: Date.now() }); } catch (e) { }
@@ -8380,6 +8412,7 @@ app.post('/save-user-data', async (req, res) => {
     }
     if (type === 'autosave') {
         try {
+            { const refused = refuseEmptyOverwrite(ppath, value, req.body.allowEmpty); if (refused) return res.status(409).json({ status: refused, error: refused, refused: 'empty-overwrite' }); }
             fs.writeFileSync(ppath, value);
             return res.status(400).json({ status: 'Autosave' });
 
@@ -8406,6 +8439,7 @@ app.post('/save-user-data', async (req, res) => {
         let vcdir = userData + '/' + user + '/' + ppath;
         vcdir = vcdir.replace(`${user}/${user}`, user)
         mkDirByPathSync(vcdir);
+        { const refused = refuseEmptyOverwrite(vc, '' + req.body.value, req.body.allowEmpty); if (refused) return res.status(409).json({ error: refused, msg: refused, refused: 'empty-overwrite' }); }
         fs.writeFileSync(vc, '' + req.body.value);
 
 
