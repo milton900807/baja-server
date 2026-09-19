@@ -7430,7 +7430,7 @@ app.get('/s/:code', (req, res) => {
             // the free sign-in).
             // A public link opens in the viewer whatever the file is called (its home is /v/<code>).
             if ((__pshare as any).access === 'public') return res.redirect(302, '/app/cpd/baja-analytics-viewer?share=' + encodeURIComponent(code));
-            if (/\.karyotype(\.json)?$/i.test('' + (__pshare.name || ''))) return res.redirect(302, '/app/manchester/karyotype?share=' + encodeURIComponent(code));
+            if (GENOME_FILE_RE.test('' + (__pshare.name || ''))) return res.redirect(302, '/app/manchester/karyotype?share=' + encodeURIComponent(code));
             // A table workbook opens in Analytics, where the recipient co-edits it live. One
             // timeline or chart shared VIEW ONLY opens in the viewer instead: the same app
             // with the menubar, navigation and every editing gesture taken away.
@@ -7514,16 +7514,26 @@ function normEmail(v: any): string {
     const s = ('' + (v == null ? '' : v)).trim().toLowerCase();
     return isValidEmail(s) ? s : '';
 }
+// A Genome Viewer file: saved as .genome; .karyotype and .karyotype.json are what it was saved
+// as before, the same format, and still open in the Genome Viewer.
+const GENOME_FILE_RE = /\.(?:genome|karyotype(?:\.json)?)$/i;
 // The design's file name, made safe for a path: same rule the public share applies.
 function shareFileName(name: any): string {
-    // Keep the extension that decides how a share opens: a .karyotype snapshot must stay a
-    // .karyotype (the Genome Viewer loads it and /s/<code> routes on it); everything else is
-    // an oligo screen and gets .baja. The base is sanitised either way.
+    // Keep the extension that decides how a share opens: a genome snapshot must stay a
+    // genome file (the Genome Viewer loads it and /s/<code> routes on it); everything else is
+    // an oligo screen and gets .baja. The base is sanitised either way. A legacy .karyotype
+    // share is written as .genome, which opens the same way.
     const raw = ('' + (name || 'shared'));
     // A .bjb (table workbook) share keeps its extension so it opens in Analytics.
-    const ext = /\.karyotype(\.json)?$/i.test(raw) ? '.karyotype' : (/\.bjb$/i.test(raw) ? '.bjb' : '.baja');
-    const base = raw.replace(/\.karyotype(\.json)?$/i, '').replace(/\.baja$/i, '').replace(/\.bjb$/i, '').replace(/[^A-Za-z0-9_\- ]+/g, '_').trim() || 'shared';
+    const ext = GENOME_FILE_RE.test(raw) ? '.genome' : (/\.bjb$/i.test(raw) ? '.bjb' : '.baja');
+    const base = raw.replace(GENOME_FILE_RE, '').replace(/\.baja$/i, '').replace(/\.bjb$/i, '').replace(/[^A-Za-z0-9_\- ]+/g, '_').trim() || 'shared';
     return base + ext;
+}
+// Two share names for the same design: equal, except that every genome extension counts as
+// one, so a share made as x.karyotype is still the share of x.genome.
+function sameShareName(a: any, b: any): boolean {
+    const n = (x: any) => ('' + (x || '')).replace(GENOME_FILE_RE, '.genome');
+    return n(a) === n(b);
 }
 // Folder label for an owner inside shared_with_me -- the spelling processShares uses.
 function ownerFolderLabel(email: string): string { return email.replace(/[^a-zA-Z0-9]/g, '_'); }
@@ -7599,7 +7609,7 @@ app.post('/share-with', async (req, res) => {
             // A whole-workbook share and a single-object share of the same file are
             // different shares (different links, different views).
             const sameObject = (r.object ? r.object.id : '') === (object ? object.id : '');
-            if (r.owner === owner && r.to === to && r.name === name && sameObject) { rec = r; break; }
+            if (r.owner === owner && r.to === to && sameShareName(r.name, name) && sameObject) { rec = r; break; }
         }
         const now = Date.now();
         if (!rec) {
@@ -7608,6 +7618,9 @@ app.post('/share-with', async (req, res) => {
             rec = { code, owner, to, name, path: '', message, created: now, updated: now, object };
             map[code] = rec;
         }
+        // A legacy .karyotype share updated now is written under its .genome name, and the
+        // record follows the file: readers join the share folder with rec.name.
+        rec.name = name;
         rec.object = object;
         rec.access = access;
         rec.message = message;
@@ -7686,7 +7699,7 @@ app.get('/share-with', (req, res) => {
         const name = req.query.name ? shareFileName(req.query.name) : '';
         const map = loadPersonShares();
         const shares = Object.keys(map).map((c) => map[c])
-            .filter((r) => r.owner === owner && (!name || r.name === name))
+            .filter((r) => r.owner === owner && (!name || sameShareName(r.name, name)))
             .sort((a, b) => b.updated - a.updated)
             .map((r) => personShareView(r, req));
         return res.json({ shares });
