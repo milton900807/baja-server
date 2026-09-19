@@ -7433,6 +7433,7 @@ app.get('/s/:code', (req, res) => {
             if (GENOME_FILE_RE.test('' + (__pshare.name || ''))) return res.redirect(302, '/app/manchester/karyotype?share=' + encodeURIComponent(code));
             // An LOH design strategy opens in the Design Viewer, which resolves ?share=<code> the same way.
             if (/\.design$/i.test('' + (__pshare.name || ''))) return res.redirect(302, '/app/manchester/design-viewer?share=' + encodeURIComponent(code));
+            if (/\.mutmax$/i.test('' + (__pshare.name || ''))) return res.redirect(302, '/app/manchester/mutmatrix-viewer?share=' + encodeURIComponent(code));
             // A table workbook opens in Analytics, where the recipient co-edits it live. One
             // timeline or chart shared VIEW ONLY opens in the viewer instead: the same app
             // with the menubar, navigation and every editing gesture taken away.
@@ -7527,9 +7528,10 @@ function shareFileName(name: any): string {
     // share is written as .genome, which opens the same way.
     const raw = ('' + (name || 'shared'));
     // A .bjb (table workbook) share keeps its extension so it opens in Analytics.
-    // A .design (an LOH design strategy) keeps its extension so it opens in the Design Viewer.
-    const ext = GENOME_FILE_RE.test(raw) ? '.genome' : (/\.bjb$/i.test(raw) ? '.bjb' : (/\.design$/i.test(raw) ? '.design' : '.baja'));
-    const base = raw.replace(GENOME_FILE_RE, '').replace(/\.baja$/i, '').replace(/\.bjb$/i, '').replace(/\.design$/i, '').replace(/[^A-Za-z0-9_\- ]+/g, '_').trim() || 'shared';
+    // A .design (an LOH design strategy) and a .mutmax (a mutational matrix) keep their
+    // extension so each opens in its own viewer.
+    const ext = GENOME_FILE_RE.test(raw) ? '.genome' : (/\.bjb$/i.test(raw) ? '.bjb' : (/\.design$/i.test(raw) ? '.design' : (/\.mutmax$/i.test(raw) ? '.mutmax' : '.baja')));
+    const base = raw.replace(GENOME_FILE_RE, '').replace(/\.baja$/i, '').replace(/\.bjb$/i, '').replace(/\.design$/i, '').replace(/\.mutmax$/i, '').replace(/[^A-Za-z0-9_\- ]+/g, '_').trim() || 'shared';
     return base + ext;
 }
 // Two share names for the same design: equal, except that every genome extension counts as
