@@ -7883,7 +7883,13 @@ app.post('/export-table', async (req, res) => {
             // labels you cannot.
             const PORTRAIT: [number, number] = [612, 792];
             const LANDSCAPE: [number, number] = [792, 612];
-            let pageW = PORTRAIT[0], pageH = PORTRAIT[1];
+            // THE FIRST PAGE TAKES THE FIRST SHEET'S ORIENTATION. Starting portrait always
+            // and turning at the first sheet left a landscape report opening on a portrait
+            // page carrying nothing but the title -- which reads exactly like landscape not
+            // working, because the page you are shown first is upright.
+            const startsLandscape = !!(sheets[0] && sheets[0].landscape);
+            let pageW = startsLandscape ? LANDSCAPE[0] : PORTRAIT[0];
+            let pageH = startsLandscape ? LANDSCAPE[1] : PORTRAIT[1];
             let top = pageH - margin;
             const bottomLimit = margin;
             let page = doc.addPage([pageW, pageH]);
