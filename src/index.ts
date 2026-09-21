@@ -7876,9 +7876,24 @@ app.post('/export-table', async (req, res) => {
             const font = await doc.embedFont(StandardFonts.Helvetica);
             const bold = await doc.embedFont(StandardFonts.HelveticaBold);
             const margin = 40, size = 9, lh = 12.5;
-            const pageW = 612, pageH = 792, top = pageH - margin, bottomLimit = margin;
+            // A PAGE CAN TURN. Letter portrait by default; a sheet asking for landscape gets
+            // landscape pages, and the next sheet that does not turns back. A timeline is
+            // wide and reads across, so its picture gets the long edge -- 712pt of drawing
+            // instead of 532pt, which is the difference between labels you can read and
+            // labels you cannot.
+            const PORTRAIT: [number, number] = [612, 792];
+            const LANDSCAPE: [number, number] = [792, 612];
+            let pageW = PORTRAIT[0], pageH = PORTRAIT[1];
+            let top = pageH - margin;
+            const bottomLimit = margin;
             let page = doc.addPage([pageW, pageH]);
             let y = top;
+            const newPage = (size?: [number, number]) => {
+                if (size) { pageW = size[0]; pageH = size[1]; }
+                top = pageH - margin;
+                page = doc.addPage([pageW, pageH]);
+                y = top;
+            };
             // Helvetica cannot encode every code point; keep it to printable ASCII.
             const sanitize = (t: string) => ('' + t).replace(/[^\x20-\x7e]/g, '?');
             // WRAP long values across lines rather than truncating them -- a chemistry string or
@@ -7908,7 +7923,7 @@ app.post('/export-table', async (req, res) => {
                 const maxChars = Math.max(6, Math.floor((pageW - margin * 2 - indent) / (sz * 0.52)));
                 const segs = wrapText('' + text, maxChars);
                 for (let k = 0; k < segs.length; k++) {
-                    if (y < bottomLimit) { page = doc.addPage([pageW, pageH]); y = top; }
+                    if (y < bottomLimit) { newPage(); }
                     const ind = indent + (k > 0 ? 14 : 0);   // hanging indent for a continued line
                     page.drawText(segs[k], { x: margin + ind, y, size: sz, font: f });
                     y -= (sz + 3.5);
@@ -7918,6 +7933,10 @@ app.post('/export-table', async (req, res) => {
             for (const sh of sheets) {
                 const cols = exportColumns(sh);
                 const images = Array.isArray(sh.images) ? sh.images.slice(0, 40) : [];
+                // Turning the page starts a new one: the orientation belongs to the sheet,
+                // and half a page cannot be portrait and half landscape.
+                const wantW = sh && sh.landscape ? LANDSCAPE[0] : PORTRAIT[0];
+                if (wantW !== pageW) newPage(sh && sh.landscape ? LANDSCAPE : PORTRAIT);
                 // The heading is the section's name and nothing else. It used to carry the
                 // record count in parentheses, which on a report whose sections are one
                 // record each -- a page per finding -- read as a stray index beside every
@@ -7925,7 +7944,7 @@ app.post('/export-table', async (req, res) => {
                 line('' + (sh.name || 'Sheet'), bold, 11);
                 y -= 2;
                 for (const r of (sh.rows || [])) {
-                    if (y < bottomLimit + lh * 2) { page = doc.addPage([pageW, pageH]); y = top; }
+                    if (y < bottomLimit + lh * 2) { newPage(); }
                     for (const c of cols) {
                         const v = exportCell(r ? r[c] : '');
                         if (v === '') continue;
@@ -7946,7 +7965,7 @@ app.post('/export-table', async (req, res) => {
                         const maxW = pageW - margin * 2, maxH = pageH - margin * 2 - 40;
                         const sc = Math.min(maxW / img.width, maxH / img.height, 1);
                         const w = img.width * sc, h = img.height * sc;
-                        if (y - h - 24 < bottomLimit) { page = doc.addPage([pageW, pageH]); y = top; }
+                        if (y - h - 24 < bottomLimit) { newPage(); }
                         page.drawImage(img, { x: margin, y: y - h, width: w, height: h });
                         y -= h + 8;
                         if (im && im.title) line('' + im.title, bold, 10);
