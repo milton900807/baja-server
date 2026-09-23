@@ -6761,6 +6761,135 @@ app.post('/status', async (req, res) => {
     res.json(status);
 });
 
+// ---- what the progress bars have learned, for everybody ----------------------------
+//
+// baja/analytics/progress-learner.js drives the long-task progress bar from measurement
+// rather than a guess: how long finished runs took, and the fraction of the run at which
+// each phase started. That history used to live in the browser's localStorage, which made
+// it per-person and per-machine -- every new visitor, and every cleared browser, started
+// the bar back at the written-in prior, and one person's twenty runs taught nobody else
+// anything. It lives here instead: ONE history per menu item (the task), shared by
+// everyone, so the tenth person to press "Indication market" gets a bar built from all
+// the runs that came before, not from their own first one.
+//
+// A key is `<task>|<variant>` -- a cached answer and a fresh search are different lengths
+// and keep separate histories. Nothing here is per-user: the rows say how long the work
+// takes, not who ran it.
+const PROGRESS_STATS_FILE = path.join(String(bigDataFilesPath || '.'), 'progress-stats.json');
+const PROGRESS_MAX_SAMPLES = 500;        // per key; the medians read all of them
+const PROGRESS_MAX_KEYS = 400;
+const PROGRESS_MAX_RUN_SECONDS = 24 * 3600;
+
+type ProgressBucket = { totals: number[]; marks: Record<string, number[]>; counts: Record<string, number[]> };
+let progressStats: Record<string, ProgressBucket> | null = null;
+let progressWriteAt = 0;
+let progressWriteTimer: NodeJS.Timeout | null = null;
+
+function progressLoad(): Record<string, ProgressBucket> {
+    if (progressStats) return progressStats;
+    try {
+        const raw = fs.readFileSync(PROGRESS_STATS_FILE, 'utf-8');
+        const db = JSON.parse(raw);
+        progressStats = (db && typeof db === 'object') ? db : {};
+    } catch (e) {
+        progressStats = {};
+    }
+    return progressStats!;
+}
+
+// Written on a short delay and through a temp file: a run ending is not worth an fsync
+// storm, and a half-written file read back at startup would lose every run ever recorded.
+function progressSaveSoon() {
+    if (progressWriteTimer) return;
+    const wait = Math.max(0, 2000 - (Date.now() - progressWriteAt));
+    progressWriteTimer = setTimeout(() => {
+        progressWriteTimer = null;
+        progressWriteAt = Date.now();
+        try {
+            const tmp = PROGRESS_STATS_FILE + '.tmp';
+            fs.writeFileSync(tmp, JSON.stringify(progressStats || {}));
+            fs.renameSync(tmp, PROGRESS_STATS_FILE);
+        } catch (e) {
+            console.log('progress-stats: could not write ' + PROGRESS_STATS_FILE + ' — ' + e);
+        }
+    }, wait);
+    if (typeof progressWriteTimer.unref === 'function') progressWriteTimer.unref();
+}
+
+const progressSlug = (v: any, max: number) => ('' + (v == null ? '' : v)).trim().replace(/[^A-Za-z0-9._-]/g, '').slice(0, max);
+const progressNum = (v: any) => (typeof v === 'number' && isFinite(v)) ? v : null;
+
+function progressPush(arr: number[], v: number) {
+    arr.push(v);
+    while (arr.length > PROGRESS_MAX_SAMPLES) arr.shift();
+}
+
+app.get('/progress-stats', async (req, res) => {
+    try {
+        const task = progressSlug(req.query.task, 64);
+        const db = progressLoad();
+        const out: Record<string, ProgressBucket> = {};
+        Object.keys(db).forEach((k) => {
+            if (task && k.indexOf(task + '|') !== 0) return;
+            out[k] = db[k];
+        });
+        res.json({ ok: true, stats: out });
+    } catch (e) {
+        res.json({ ok: false, stats: {} });
+    }
+});
+
+app.post('/progress-stats', async (req, res) => {
+    try {
+        const body = req.body || {};
+        const task = progressSlug(body.task, 64);
+        const variant = progressSlug(body.variant, 32) || 'default';
+        const total = progressNum(body.total);
+        if (!task) return res.json({ ok: false, error: 'task required' });
+        // A run that took no time, or longer than a day, is a clock change or a bug --
+        // folding either into the history would poison the estimate for everyone.
+        if (total == null || total <= 0.25 || total > PROGRESS_MAX_RUN_SECONDS) {
+            return res.json({ ok: false, error: 'implausible total' });
+        }
+
+        const db = progressLoad();
+        const key = task + '|' + variant;
+        if (!db[key] && Object.keys(db).length >= PROGRESS_MAX_KEYS) {
+            return res.json({ ok: false, error: 'too many keys' });
+        }
+        let b = db[key];
+        if (!b) b = db[key] = { totals: [], marks: {}, counts: {} };
+        if (!Array.isArray(b.totals)) b.totals = [];
+        if (!b.marks || typeof b.marks !== 'object') b.marks = {};
+        if (!b.counts || typeof b.counts !== 'object') b.counts = {};
+
+        progressPush(b.totals, total);
+
+        const marks = (body.marks && typeof body.marks === 'object') ? body.marks : {};
+        Object.keys(marks).slice(0, 40).forEach((raw) => {
+            const id = progressSlug(raw, 32);
+            const f = progressNum(marks[raw]);
+            if (!id || f == null || f < 0 || f > 1) return;
+            if (!Array.isArray(b.marks[id])) b.marks[id] = [];
+            progressPush(b.marks[id], f);
+        });
+
+        const counts = (body.counts && typeof body.counts === 'object') ? body.counts : {};
+        Object.keys(counts).slice(0, 40).forEach((raw) => {
+            const id = progressSlug(raw, 32);
+            const n = progressNum(counts[raw]);
+            if (!id || n == null || n < 0 || n > 10000) return;
+            if (!Array.isArray(b.counts[id])) b.counts[id] = [];
+            progressPush(b.counts[id], Math.round(n));
+        });
+
+        progressSaveSoon();
+        res.json({ ok: true, runs: b.totals.length });
+    } catch (e) {
+        res.json({ ok: false, error: '' + e });
+    }
+});
+
 
 
 app.post('/git-tag-release', async (req, res) => {
@@ -7850,6 +7979,15 @@ function exportCell(v: any): string {
     if (typeof v === 'object') { try { return JSON.stringify(v); } catch { return '' + v; } }
     return '' + v;
 }
+// A SPREADSHEET SHOULD ADD UP. The PDF path measures and wraps text, so everything there
+// is a string; a sheet is not a picture, and a column of numbers written as text is a
+// column Excel will not sum, average or chart -- which is most of the reason to want the
+// xlsx rather than the CSV. Only a real number passes through as one: a STRING that looks
+// like a number stays a string, because a cell holding "007" or "1-2" means it.
+function exportCellX(v: any): string | number {
+    if (typeof v === 'number' && isFinite(v)) return v;
+    return exportCell(v);
+}
 app.post('/export-table', async (req, res) => {
     try {
         const format = ('' + (req.body?.format || '')).toLowerCase();
@@ -7862,7 +8000,7 @@ app.post('/export-table', async (req, res) => {
         if (format === 'xlsx') {
             const data = sheets.map((sh: any, i: number) => {
                 const cols = exportColumns(sh);
-                const body = (sh.rows || []).map((r: any) => cols.map((c) => exportCell(r ? r[c] : '')));
+                const body = (sh.rows || []).map((r: any) => cols.map((c) => exportCellX(r ? r[c] : '')));
                 const name = ('' + (sh.name || ('Sheet' + (i + 1)))).replace(/[\\/?*\[\]:]/g, ' ').slice(0, 31) || ('Sheet' + (i + 1));
                 return { name, data: [cols].concat(body) };
             });
