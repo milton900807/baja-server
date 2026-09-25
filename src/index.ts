@@ -7410,6 +7410,77 @@ async function freeCharge(req: any, metric: 'design' | 'offtarget', want: number
     return { allowed: take, gate: null, metered: true };
 }
 
+// ---- the AI CREDIT allowance ------------------------------------------------------------
+// A non-subscriber gets $10 of model usage. The count lives in the python meter's sqlite,
+// which this process has no driver for, so py/ion-lib/claude_usage.py publishes the three
+// facts needed to refuse a call -- each user's balance, the limit, and WHICH SCRIPTS SPEND
+// IT -- beside it as plain JSON. That last set maintains itself: it is the scripts that have
+// ever billed a token, not a list anybody keeps up to date.
+//
+// This has to be decided BEFORE the spawn. /py answers the moment a script has started (the
+// output is streamed to a file and polled), so there is no later moment at which a 402 can
+// still be sent.
+let __creditGate: { at: number; mtime: number; data: any } = { at: 0, mtime: 0, data: null };
+function creditGateData(): any {
+    try {
+        // The same place the python tools are given, not process.env: BIGDATA is built into
+        // each spawned script's environment from bigDataFilesPath and is not necessarily set
+        // on this process at all -- which is why the gate read nothing and let everyone
+        // through the first time it was deployed.
+        const bd = String(bigDataFilesPath || process.env.BIGDATA || process.env.BIG_DATA || '');
+        if (!bd) return null;
+        const p = path.join(bd, 'credit-gate.json');
+        const st = fs.statSync(p);
+        const mtime = +st.mtimeMs;
+        if (__creditGate.data && __creditGate.mtime === mtime) return __creditGate.data;
+        const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+        __creditGate = { at: Date.now(), mtime, data };
+        return data;
+    } catch (e) {
+        return null;          // no file, unreadable, mid-write: let the call through
+    }
+}
+
+/** null when the call may proceed; the 402 body when it may not. */
+async function creditGate(req: any, scriptPath: string): Promise<any | null> {
+    try {
+        const g = creditGateData();
+        if (!g || !g.limit) return null;
+        // Only the tools that actually spend credits. A script nobody has run yet has cost
+        // nobody anything and is not gated.
+        const name = String(scriptPath || '').split('/').pop()!.replace(/\.py$/i, '');
+        const spends = Array.isArray(g.ai_scripts) && g.ai_scripts.indexOf(name) >= 0;
+        if (!spends) return null;
+        const email = canonicalUserEmail(freeUserKey(req));
+        if (!email) return null;                      // unidentified: not metered
+        if (await isSubscribed(email)) return null;
+        const used = Number((g.balances || {})[email] || 0);
+        if (!(used >= Number(g.limit))) return null;
+        return creditLimitBody(used, Number(g.limit));
+    } catch (e) {
+        return null;          // the gate must never be the reason a request fails
+    }
+}
+
+// The 402 body for the credit allowance, in the same shape as the design one so the client
+// renders it with the machinery it already has.
+function creditLimitBody(used: number, limit: number): any {
+    const dollars = (n: number) => '$' + (n / 100).toFixed(2);
+    return {
+        error: 'free-limit',
+        metric: 'credits',
+        used: Math.round(used),
+        limit: Math.round(limit),
+        usedUsd: dollars(used),
+        limitUsd: dollars(limit),
+        // No reset date: this allowance does not refill. Saying when it does would be a lie
+        // and saying nothing invites the question, so the message answers it.
+        resetsOn: null,
+        message: 'You have used the ' + dollars(limit) + ' of AI credits that come with the free plan.'
+            + ' Subscribe to keep going — everything you have made stays where it is.'
+    };
+}
+
 // The 402 body, kept in one place so the wording cannot drift between callers.
 function freeLimitBody(metric: 'design' | 'offtarget', usedNow: number): any {
     return {
@@ -10008,6 +10079,13 @@ const ppath = async (req: {
     const pythonScriptPath = t;
     const filePath: string = __filePath.toString();
 
+    // THE CREDIT ALLOWANCE, before anything is started. This route answers as soon as a
+    // script is running, so this is the last moment a 402 can be sent.
+    {
+        const __gate = await creditGate(req, pythonScriptPath);
+        if (__gate) return res.status(402).json(__gate);
+    }
+
     try {
 
         const env = buildPythonEnv(req);
@@ -10167,6 +10245,13 @@ const post_ppath = async (req: { path: any; body: any; headers: { [x: string]: a
     }
 
     const pythonScriptPath = t;
+
+    // Same gate as the GET bridge: decided before the spawn, because after it there is no
+    // response left to put a 402 in.
+    {
+        const __gate = await creditGate(req, pythonScriptPath);
+        if (__gate) return res.status(402).json(__gate);
+    }
 
     // ✅ Clone current environment and optionally add x-user-id header
     const env = buildPythonEnv(req);
