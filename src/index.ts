@@ -4473,6 +4473,29 @@ function encodeEmail(email: string) {
     encrypted += cipher.final('hex');
     return '' + encrypted;
 }
+// THE USER, IN ONE FORM, WHATEVER FORM ARRIVED.
+//
+// x-user-id reaches this server as a plain address from some clients and as an encodeEmail()
+// ciphertext from others, and the two spawn paths below disagreed about which to hand the
+// python tools: buildPythonEnv encrypts what it is given, and the /py route then decrypts the
+// header again over the top. Anything keyed on that identity was therefore keyed on two
+// different strings for one person -- which is why the usage meter recorded real work under a
+// ciphertext while "Credits usage", asking by email address, read zero.
+//
+// This accepts either form and always answers with the address. It never throws: an identity
+// it cannot make sense of comes back empty, and the caller decides what that means.
+function canonicalUserEmail(raw: any): string {
+    const s = String(raw == null ? "" : raw).trim();
+    if (!s) return "";
+    if (s.indexOf("@") >= 0) return s.toLowerCase();
+    if (!/^[0-9a-f]+$/i.test(s) || (s.length % 32) !== 0) return "";
+    try {
+        const d = decodeEmail(s);
+        if (d && d.indexOf("@") >= 0) return d.trim().toLowerCase();
+    } catch (e) { /* not our ciphertext */ }
+    return "";
+}
+
 function decodeEmail(encodedEmail: string) {
     const decipher = crypto.createDecipheriv('aes-256-cbc', byteArray.toString('hex'), iv);
     let decrypted = decipher.update(encodedEmail, 'hex', 'utf-8');
@@ -9708,6 +9731,11 @@ function buildPythonEnv(req: any) {
         env.SENDER_WORKINGDIRECTORY =
             "/" + getKey("user") + "/" + env.SENDER_USER_ID;
     }
+    // THE SAME PERSON, SPELLED THE SAME WAY EVERY TIME. SENDER_USER_ID is whatever the path
+    // that set it decided on -- ciphertext here, plaintext on the /py route below -- and is
+    // left alone because the working directory is built from it. Anything that has to
+    // RECOGNISE a user across requests (the usage meter, and its report) uses this instead.
+    try { env.SENDER_USER_EMAIL = canonicalUserEmail(userId); } catch (e) { }
 
     return env;
 }
@@ -9986,9 +10014,12 @@ const ppath = async (req: {
 
 
         const userIdHeader = req.headers['x-user-id'];
-        console.log(" user id " + userIdHeader)
         if (userIdHeader && typeof userIdHeader === 'string') {
-            env.SENDER_USER_ID = decodeEmail(userIdHeader);
+            try { env.SENDER_USER_ID = decodeEmail(userIdHeader); } catch (e) { }
+            // Recomputed from the header rather than trusted from above: this route is handed
+            // the encrypted form by some clients and the plain one by others.
+            const em = canonicalUserEmail(userIdHeader);
+            if (em) env.SENDER_USER_EMAIL = em;
         }
 
 
