@@ -233,7 +233,10 @@ async function main() {
         const users = knownUsers();
         if (!(await warnUnknown(email, users, yes))) die('Cancelled.');
         const acc = readAccess();
-        acc.blocked[email] = { at: now, reason: reason || '', by: os.userInfo().username };
+        // `message` is what the API shows the blocked user (index.ts reads b.message); `reason`
+        // is the operator's note. Default the user-facing message to the reason so a single
+        // `block <email> "<text>"` both records why and tells the user what they see.
+        acc.blocked[email] = { at: now, reason: reason || '', message: reason || '', by: os.userInfo().username };
         writeAccess(acc);
         console.log('  blocked ' + email + (reason ? ' -- ' + reason : ''));
         console.log('  Their next request is refused with 403. Signing in again will NOT lift it.');
