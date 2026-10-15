@@ -607,7 +607,10 @@ app.get(['/api/variants/region', '/variants/region'], async (req: any, res: any)
     try {
         const species = String(req.query.species || 'human').trim() || 'human';
         const region = String(req.query.region || '').trim();   // "17:7676100-7676300"
-        const limit = Math.max(1, Math.min(2000, parseInt(String(req.query.limit || '500'), 10) || 500));
+        // A whole-gene load on a large locus needs tens of thousands, not hundreds: DMD holds
+        // >10,000 ClinVar records. The old 500/2000 pair truncated such a gene mid-way and
+        // (below) reported truncated:false while doing it.
+        const limit = Math.max(1, Math.min(60000, parseInt(String(req.query.limit || '20000'), 10) || 20000));
         if (!region) return res.json({ db, variants: [], error: 'no region' });
         const m = region.match(/^(\w+):(\d+)-(\d+)$/);
         if (!m) return res.json({ db, variants: [], error: 'bad region' });
@@ -617,9 +620,14 @@ app.get(['/api/variants/region', '/variants/region'], async (req: any, res: any)
         // when a local query engine (tabix CLI or pysam) is available; otherwise fall
         // through to the live API rather than silently returning nothing.
         if (variantDbReady(db) && (await hasTabix() || await hasPysam())) {
-            const variants = await queryLocalVcf(variantDbLocalPath(db)!, chr, start, end, db, limit);
-            const total = variants.length;
-            return res.json({ db, region, source: 'local', total, count: variants.length, truncated: false, variants });
+            // Ask for one more than the limit so a full page can be told apart from a page
+            // that happens to end exactly on it; that extra row is dropped before replying.
+            const variants = await queryLocalVcf(variantDbLocalPath(db)!, chr, start, end, db, limit + 1);
+            const truncated = variants.length > limit;
+            if (truncated) variants.length = limit;
+            // truncated was hardcoded false here, so a half-read gene came back looking whole.
+            const cutAt = truncated ? variants[variants.length - 1]?.start ?? null : null;
+            return res.json({ db, region, source: 'local', total: variants.length, count: variants.length, truncated, cutAt, limit, variants });
         }
         // Downloadable DB not present yet -> fetch it into the reference store for next time,
         // and serve this request from the live API meanwhile.
