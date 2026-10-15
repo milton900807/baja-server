@@ -165,7 +165,7 @@ if want_be; then
   # copies it into conf.d again; the restart below reloads nginx but does not do that.
   c "Syncing geo tools → $REMOTE_GEO  (databases preserved)"
   "${RSYNC[@]}" --include 'build-geoblock.py' --include 'refresh-geo.sh' \
-    --include 'traffic-report.py' --include 'cities-csv.py' --include 'ip-activity.py' \
+    --include 'traffic-report.py' --include 'cities-csv.py' --include 'ip-activity.py' --include 'auto-blocklist.py' \
     --exclude '*' "$HERE/geoblock/" "$SERVER:$REMOTE_GEO/"
   c "Syncing geoblock plumbing → $REMOTE_GEOBLOCK  (rules, allow, enforce, networks preserved)"
   "${RSYNC[@]}" --include 'install-geoblock.sh' --include '00-baja-geoblock.conf' \

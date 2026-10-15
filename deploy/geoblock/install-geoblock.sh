@@ -104,6 +104,9 @@ install)
     need_root
     [ -f "$DIR/networks.conf" ] || die "no $DIR/networks.conf -- run build-geoblock.py first"
     [ -s "$DIR/networks.conf" ] || die "$DIR/networks.conf is empty"
+    for f in blocklist.conf blocklist-auto.conf; do   # the template includes them literally
+        [ -f "$DIR/$f" ] || : > "$DIR/$f"
+    done
     cp -p "$DIR/00-baja-geoblock.conf" "$CONFD/00-baja-geoblock.conf"
     backup_all
     add_includes
