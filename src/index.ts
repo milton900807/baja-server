@@ -6301,6 +6301,48 @@ app.get('/load-file', async (req, res) => {
 
 
 /**
+ * The raw bytes of one file in the caller's OWN folder (a VCF, a .vcf.gz), with Range support.
+ * /load-file parses JSON and cannot return these. Only the caller's folder is reachable: the
+ * path is resolved under userData/<encoded user> and anything that leaves it is refused.
+ *   GET /user-file?user=<email>&path=<path as the file browser reports it>
+ */
+app.get('/user-file', (req, res) => {
+    try {
+        const user = String(req.query.user || '').trim();
+        let rel = String(req.query.path || '').trim();
+        if (!user || !rel) return res.status(400).json({ msg: 'Missing user or path.' });
+        const enc = encodeEmail(user);
+        rel = rel.replace(/\\/g, '/').replace(/^\/+/, '');
+        const segs = rel.split('/').filter(Boolean);
+        if (segs.length && (segs[0] === enc || segs[0].toLowerCase() === 'myfiles')) segs.shift();
+        const base = path.resolve(userData, enc);
+        const file = path.resolve(base, ...segs);
+        if (!segs.length || !file.startsWith(base + path.sep)) return res.status(403).json({ msg: 'Access denied.' });
+        let st: fs.Stats;
+        try { st = fs.statSync(file); } catch (e) { return res.status(404).json({ msg: 'File not found.' }); }
+        if (!st.isFile()) return res.status(400).json({ msg: 'Not a file.' });
+        const size = st.size;
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.setHeader('Accept-Ranges', 'bytes');
+        res.setHeader('Cache-Control', 'no-store');
+        const m = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range || ''));
+        if (m && (m[1] || m[2])) {
+            const start = m[1] ? parseInt(m[1], 10) : Math.max(0, size - parseInt(m[2], 10));
+            const end = m[1] && m[2] ? Math.min(size - 1, parseInt(m[2], 10)) : size - 1;
+            if (!(start <= end) || start >= size) { res.setHeader('Content-Range', 'bytes */' + size); return res.status(416).end(); }
+            res.status(206);
+            res.setHeader('Content-Range', 'bytes ' + start + '-' + end + '/' + size);
+            res.setHeader('Content-Length', String(end - start + 1));
+            return fs.createReadStream(file, { start, end }).on('error', () => res.destroy()).pipe(res);
+        }
+        res.setHeader('Content-Length', String(size));
+        return fs.createReadStream(file).on('error', () => res.destroy()).pipe(res);
+    } catch (e: any) {
+        return res.status(500).json({ msg: 'Failed to read the file.' });
+    }
+});
+
+/**
  *  Can only remove user files not other drive files
  */
 app.post('/rm', async (req, res) => {
