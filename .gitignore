@@ -72,3 +72,4 @@ deploy/env-prod.js
 # Per-IP traffic reports pulled from the server (visitor addresses and emails)
 deploy/geoblock/ip-activity-*.csv
 deploy/geoblock/ip-activity-*.json
+build-test/

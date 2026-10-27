@@ -17,6 +17,7 @@ import { ELNDocTracker } from "./eln/elndocs";
 import { DataIndex } from "./d-index";
 import { TemplateServer } from "./usertemplates/template-server";
 import { PyCompute } from "./pycompute/py-comp";
+import { AnalyticsTemplates } from "./analytics-templates";
 import { spawn, exec } from "child_process";
 import Stripe from "stripe";
 import { EnvConfig, environment } from "./environment";
@@ -781,6 +782,14 @@ const templateServer = new TemplateServer();
 templateServer.updateAPI(app);
 const pyComp = new PyCompute();
 pyComp.updateAPI(app);
+// Baja Analytics template library: built-ins from baja-apps, plus each user's own published
+// templates in their user folder. encodeEmail is called per request, after it is initialised.
+const analyticsTemplates = new AnalyticsTemplates({
+    appsDir: () => wd,
+    userData,
+    encodeEmail: (email: string) => encodeEmail(email),
+});
+analyticsTemplates.updateAPI(app);
 const cachd = new Map();
 
 
