@@ -3768,7 +3768,11 @@ app.get('/f/:code', (req: any, res: any) => {
     const host = ('' + (req.headers['x-forwarded-host'] || req.headers.host || '')).split(',')[0].trim();
     const proto = ('' + (req.headers['x-forwarded-proto'] || 'https')).split(',')[0].trim();
     const base = proto + '://' + host;
-    const target = base + '/app/manchester/viewer-fundraise?s=' + encodeURIComponent(code);
+    // The display puts /f/<code> back in the address bar once it is up, so this is also
+    // the URL a donor comes back to from the payment page. Carry the flag through, or the
+    // thank-you is lost on the way.
+    const thanks = (('' + (req.query.donated || '')) === '1') ? '&donated=1' : '';
+    const target = base + '/app/manchester/viewer-fundraise?s=' + encodeURIComponent(code) + thanks;
     const hit = __fundraiseByCode(code);
     const e = (t: any) => ('' + (t == null ? '' : t)).replace(/[&<>"]/g, (c: string) =>
         ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' } as any)[c]);
