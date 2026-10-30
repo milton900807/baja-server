@@ -3636,6 +3636,86 @@ app.post(['/stripe/donation-session', '/api/stripe/donation-session'], async (re
     }
 });
 
+// RECONCILING DONATIONS BACK ONTO THE CAMPAIGN. A paid Checkout session is known to Stripe
+// and to nobody else: the display's total is a number in a document, and nothing was raising
+// it. This asks Stripe which sessions for one campaign have actually been paid and folds the
+// ones it has not seen before into that campaign's document.
+//
+// Stripe is the source of truth and this endpoint adds nothing of its own: an amount appears
+// only because Stripe reports payment_status 'paid' for a session whose metadata names this
+// campaign. That is what makes it safe to leave public, as the display that calls it is. A
+// caller who hammers it can make the campaign agree with Stripe, which it already does.
+//
+// Each gift records the session id, and a session already recorded is skipped, so running it
+// twice does not count a donation twice.
+//
+// NAMES ARE NOT PUBLISHED BY DEFAULT. The campaign document is fetched whole by the public
+// display, so anything written here is readable by anyone with the link. A donor gave their
+// name to Stripe to pay, not to a wall in a room, so gifts land as "Anonymous" unless the
+// campaign sets donate.showNames. The email Stripe collected is never written at all.
+const DONATION_SYNC_LAST: { [path: string]: number } = {};
+app.post(['/stripe/donation-sync', '/api/stripe/donation-sync'], async (req: any, res: any) => {
+    if (!stripeReady(res)) return;
+    try {
+        const rel = ('' + ((req.body && req.body.path) || '')).trim();
+        if (!rel || !/\.fund$/i.test(rel)) return res.status(400).json({ error: 'bad_path' });
+        // The path comes from a public page, so it is resolved inside the user-data root and
+        // anything that climbs out of it is refused.
+        const rootDir = path.resolve(userData);
+        const target = path.resolve(rootDir, rel.replace(/^\/+/, ''));
+        if (target !== rootDir && !target.startsWith(rootDir + path.sep)) return res.status(403).json({ error: 'forbidden' });
+        if (!fs.existsSync(target)) return res.status(404).json({ error: 'no_campaign' });
+
+        // One list call per campaign per 15s, however many displays are watching it.
+        const now = Date.now();
+        const last = DONATION_SYNC_LAST[target] || 0;
+        if (now - last < 15000) return res.json({ ok: true, skipped: 'cooldown', added: 0 });
+        DONATION_SYNC_LAST[target] = now;
+
+        let doc: any = null;
+        try { doc = JSON.parse(fs.readFileSync(target, 'utf-8')); } catch (e) { doc = null; }
+        if (!doc || typeof doc !== 'object' || (doc.kind && doc.kind !== 'fundraise')) return res.status(400).json({ error: 'not_a_campaign' });
+
+        const gifts = Array.isArray(doc.gifts) ? doc.gifts : (doc.gifts = []);
+        const seen: { [id: string]: boolean } = {};
+        for (const g of gifts) if (g && g.sid) seen['' + g.sid] = true;
+
+        // A week is long enough to catch anything missed while a display was closed, and
+        // short enough that this stays one page of results.
+        const since = Math.floor((now - 7 * 24 * 3600 * 1000) / 1000);
+        const list = await stripeClient!.checkout.sessions.list({ limit: 100, created: { gte: since } });
+        const showNames = !!(doc.donate && doc.donate.showNames);
+        const zeroDec = (cur: string) => cur === 'jpy';
+
+        let added = 0, addedTotal = 0;
+        for (const ses of list.data) {
+            const md: any = ses.metadata || {};
+            if (md.kind !== 'fundraise-donation') continue;
+            if (('' + (md.campaignPath || '')).replace(/^\/+/, '') !== rel.replace(/^\/+/, '')) continue;
+            if (ses.payment_status !== 'paid') continue;
+            if (seen[ses.id]) continue;
+            const cur = ('' + (ses.currency || 'usd')).toLowerCase();
+            const amount = (ses.amount_total || 0) / (zeroDec(cur) ? 1 : 100);
+            if (!(amount > 0)) continue;
+            const nm = showNames ? ('' + ((ses.customer_details && ses.customer_details.name) || '')).slice(0, 60).trim() : '';
+            gifts.unshift({
+                amount: amount, name: nm, note: '', via: 'stripe', sid: ses.id,
+                at: new Date((ses.created || Math.floor(now / 1000)) * 1000).toISOString(),
+            });
+            doc.raised = (+doc.raised || 0) + amount;
+            doc.donors = (+doc.donors || 0) + 1;
+            added++; addedTotal += amount;
+        }
+        if (!added) return res.json({ ok: true, added: 0 });
+        if (gifts.length > 200) gifts.length = 200;
+        doc.updated = new Date().toISOString();
+        fs.writeFileSync(target, JSON.stringify(doc));
+        return res.json({ ok: true, added: added, amount: addedTotal, raised: doc.raised, donors: doc.donors });
+    } catch (e: any) {
+        return res.status(500).json({ error: 'stripe_error', error_description: e?.message || String(e) });
+    }
+});
+
 // Open the Stripe billing portal (manage / cancel subscription); returns { url }.
 app.post(['/stripe/portal', '/api/stripe/portal'], async (req: any, res: any) => {
     if (!stripeReady(res)) return;
