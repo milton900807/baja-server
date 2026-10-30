@@ -3577,7 +3577,7 @@ app.get(['/stripe/donation-session', '/api/stripe/donation-session'], (_req: any
 app.post(['/stripe/donation-session', '/api/stripe/donation-session'], async (req: any, res: any) => {
     if (!stripeReady(res)) return;
     try {
-        const { amount, currency, campaign, path: campaignPath, returnUrl, email } = req.body || {};
+        const { amount, currency, campaign, path: campaignPath, returnUrl, email, donorName, donorNote } = req.body || {};
         const cur = String(currency || 'usd').toLowerCase();
         if (DONATION_CURRENCIES.indexOf(cur) < 0) return res.status(400).json({ error: 'bad_currency' });
         const amt = Number(amount);
@@ -3605,6 +3605,11 @@ app.post(['/stripe/donation-session', '/api/stripe/donation-session'], async (re
         const sep = back.indexOf('?') >= 0 ? '&' : '?';
 
         const name = String(campaign || '').slice(0, 120).trim();
+        // Carried on the payment so the reconciler can put it on the campaign's page. A name
+        // typed into "your name" is the donor publishing it themselves, which is why it is
+        // kept apart from the name on the card.
+        const dName = String(donorName || '').replace(/[\r\n\t]+/g, ' ').slice(0, 40).trim();
+        const dNote = String(donorNote || '').replace(/[\r\n\t]+/g, ' ').slice(0, 140).trim();
         const session = await stripeClient!.checkout.sessions.create({
             mode: 'payment',
             submit_type: 'donate',
@@ -3622,10 +3627,15 @@ app.post(['/stripe/donation-session', '/api/stripe/donation-session'], async (re
                 kind: 'fundraise-donation',
                 campaign: name,
                 campaignPath: String(campaignPath || '').slice(0, 300),
+                ...(dName ? { donorName: dName } : {}),
+                ...(dNote ? { donorNote: dNote } : {}),
             },
             payment_intent_data: {
                 description: name ? ('Donation to ' + name) : 'Donation',
-                metadata: { kind: 'fundraise-donation', campaign: name, campaignPath: String(campaignPath || '').slice(0, 300) },
+                metadata: {
+                    kind: 'fundraise-donation', campaign: name, campaignPath: String(campaignPath || '').slice(0, 300),
+                    ...(dName ? { donorName: dName } : {}), ...(dNote ? { donorNote: dNote } : {}),
+                },
             },
             success_url: back + sep + 'donated=1',
             cancel_url: back,
@@ -3679,6 +3689,10 @@ app.post(['/stripe/donation-sync', '/api/stripe/donation-sync'], async (req: any
         const gifts = Array.isArray(doc.gifts) ? doc.gifts : (doc.gifts = []);
         const seen: { [id: string]: boolean } = {};
         for (const g of gifts) if (g && g.sid) seen['' + g.sid] = true;
+        // A gift the organiser took off the list stays off: without this it would be read
+        // back in on the next pass and counted a second time, which is worse than the
+        // message they were removing.
+        for (const sid of (Array.isArray(doc.giftsSkip) ? doc.giftsSkip : [])) seen['' + sid] = true;
 
         // A week is long enough to catch anything missed while a display was closed, and
         // short enough that this stays one page of results.
@@ -3697,9 +3711,14 @@ app.post(['/stripe/donation-sync', '/api/stripe/donation-sync'], async (req: any
             const cur = ('' + (ses.currency || 'usd')).toLowerCase();
             const amount = (ses.amount_total || 0) / (zeroDec(cur) ? 1 : 100);
             if (!(amount > 0)) continue;
-            const nm = showNames ? ('' + ((ses.customer_details && ses.customer_details.name) || '')).slice(0, 60).trim() : '';
+            // What the donor typed into "your name" is theirs to publish and always shows.
+            // The name on the card is a different thing: it was given to pay, not to be
+            // listed, so it appears only if the campaign asks for it.
+            const typed = ('' + (md.donorName || '')).slice(0, 40).trim();
+            const billed = showNames ? ('' + ((ses.customer_details && ses.customer_details.name) || '')).slice(0, 60).trim() : '';
             gifts.unshift({
-                amount: amount, name: nm, note: '', via: 'stripe', sid: ses.id,
+                amount: amount, name: typed || billed, note: ('' + (md.donorNote || '')).slice(0, 140).trim(),
+                via: 'stripe', sid: ses.id,
                 at: new Date((ses.created || Math.floor(now / 1000)) * 1000).toISOString(),
             });
             doc.raised = (+doc.raised || 0) + amount;
