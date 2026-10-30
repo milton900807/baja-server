@@ -3569,13 +3569,15 @@ app.get(['/stripe/donation-session', '/api/stripe/donation-session'], (_req: any
         endpoint: '/stripe/donation-session',
         method: 'POST',
         body: { amount: 'number', currency: DONATION_CURRENCIES, campaign: 'string', path: 'string', returnUrl: 'same-origin url', email: 'optional' },
-        stripeConfigured: !!stripeClient,
-        note: 'POST only. Payment methods are whatever is enabled on the Stripe account; this endpoint names none.',
+        stripeConfigured: !!stripeDonations(),
+        donationAccountIsSeparate: donationsSeparate(),
+        note: 'POST only. Donations use STRIPE_DONATION_SECRET_KEY when it is set, otherwise STRIPE_SECRET_KEY.'
+            + ' Payment methods are whatever is enabled on that account; this endpoint names none.',
     });
 });
 
 app.post(['/stripe/donation-session', '/api/stripe/donation-session'], async (req: any, res: any) => {
-    if (!stripeReady(res)) return;
+    if (!donationsReady(res)) return;
     try {
         const { amount, currency, campaign, path: campaignPath, returnUrl, email, donorName, donorNote } = req.body || {};
         const cur = String(currency || 'usd').toLowerCase();
@@ -3610,7 +3612,7 @@ app.post(['/stripe/donation-session', '/api/stripe/donation-session'], async (re
         // kept apart from the name on the card.
         const dName = String(donorName || '').replace(/[\r\n\t]+/g, ' ').slice(0, 40).trim();
         const dNote = String(donorNote || '').replace(/[\r\n\t]+/g, ' ').slice(0, 140).trim();
-        const session = await stripeClient!.checkout.sessions.create({
+        const session = await stripeDonations()!.checkout.sessions.create({
             mode: 'payment',
             submit_type: 'donate',
             // No payment_method_types: see above. Every method enabled on the account shows.
@@ -3665,7 +3667,7 @@ app.post(['/stripe/donation-session', '/api/stripe/donation-session'], async (re
 // campaign sets donate.showNames. The email Stripe collected is never written at all.
 const DONATION_SYNC_LAST: { [path: string]: number } = {};
 app.post(['/stripe/donation-sync', '/api/stripe/donation-sync'], async (req: any, res: any) => {
-    if (!stripeReady(res)) return;
+    if (!donationsReady(res)) return;
     try {
         const rel = ('' + ((req.body && req.body.path) || '')).trim();
         if (!rel || !/\.fund$/i.test(rel)) return res.status(400).json({ error: 'bad_path' });
@@ -3697,7 +3699,7 @@ app.post(['/stripe/donation-sync', '/api/stripe/donation-sync'], async (req: any
         // A week is long enough to catch anything missed while a display was closed, and
         // short enough that this stays one page of results.
         const since = Math.floor((now - 7 * 24 * 3600 * 1000) / 1000);
-        const list = await stripeClient!.checkout.sessions.list({ limit: 100, created: { gte: since } });
+        const list = await stripeDonations()!.checkout.sessions.list({ limit: 100, created: { gte: since } });
         const showNames = !!(doc.donate && doc.donate.showNames);
         const zeroDec = (cur: string) => cur === 'jpy';
 
@@ -3734,6 +3736,48 @@ app.post(['/stripe/donation-sync', '/api/stripe/donation-sync'], async (req: any
         return res.status(500).json({ error: 'stripe_error', error_description: e?.message || String(e) });
     }
 });
+
+// TWO STRIPE ACCOUNTS, ON PURPOSE.
+//
+// The software subscription and the fundraising donations are different money going to
+// different places, and they are different Stripe accounts. STRIPE_SECRET_KEY stays what it
+// always was -- the subscription account -- and donations use STRIPE_DONATION_SECRET_KEY.
+//
+// This matters beyond tidiness: a price, a customer and a payment all belong to ONE account.
+// Pointing both at one key made the subscription price vanish ("No such price"), because the
+// price had been created under the other account.
+//
+// If the donation key is not set, donations fall back to the subscription key and the system
+// behaves exactly as it did before this split, which is what makes the change safe to deploy
+// before the second key exists.
+//
+// A function declaration, not a const: these endpoints are inserted into the built file as
+// separate blocks whose order is not guaranteed, and a hoisted function is callable from any
+// of them whatever order they end up in.
+let __donationStripe: any = null;
+function stripeDonations(): any {
+    const k = ('' + (process.env.STRIPE_DONATION_SECRET_KEY || process.env.STRIPE_SECRET_KEY || '')).trim();
+    if (!k) return null;
+    if (!__donationStripe || __donationStripe.__bajaKey !== k) {
+        __donationStripe = new Stripe(k);
+        __donationStripe.__bajaKey = k;
+    }
+    return __donationStripe;
+}
+function donationsSeparate(): boolean {
+    const d = ('' + (process.env.STRIPE_DONATION_SECRET_KEY || '')).trim();
+    return !!d && d !== ('' + (process.env.STRIPE_SECRET_KEY || '')).trim();
+}
+function donationsReady(res: any): boolean {
+    if (!stripeDonations()) {
+        res.status(500).json({
+            error: 'stripe_not_configured',
+            error_description: 'Set STRIPE_DONATION_SECRET_KEY (or STRIPE_SECRET_KEY) on the server.',
+        });
+        return false;
+    }
+    return true;
+}
 
 // THE SHORT LINK A CAMPAIGN IS SHARED BY:  https://<host>/f/<code>
 //
@@ -3847,9 +3891,9 @@ app.get('/f/:code', (req: any, res: any) => {
 // opening the Stripe dashboard. This reports what the account has configured, so the console
 // can say so, and a wallet that is off is a setting to change rather than a mystery.
 app.get(['/stripe/payment-methods', '/api/stripe/payment-methods'], async (_req: any, res: any) => {
-    if (!stripeReady(res)) return;
+    if (!donationsReady(res)) return;
     try {
-        const list = await stripeClient!.paymentMethodConfigurations.list({ limit: 20 });
+        const list = await stripeDonations()!.paymentMethodConfigurations.list({ limit: 20 });
         const cfg: any = list.data.filter((c: any) => c.is_default)[0] || list.data[0];
         if (!cfg) return res.json({ ok: true, configured: false, on: [], off: [] });
         // A configuration holds one entry per method, each with a display preference. The
@@ -3960,12 +4004,12 @@ app.post(['/fundraise/campaigns', '/api/fundraise/campaigns'], (req: any, res: a
 // the campaign document, not from here). The fee comes from each charge's balance
 // transaction, which is the only place Stripe states it.
 app.post(['/stripe/donation-report', '/api/stripe/donation-report'], async (req: any, res: any) => {
-    if (!stripeReady(res)) return;
+    if (!donationsReady(res)) return;
     try {
         const rel = ('' + ((req.body && req.body.path) || '')).trim();
         if (!rel || !/\.fund$/i.test(rel)) return res.status(400).json({ error: 'bad_path' });
         const q = "metadata['campaignPath']:'" + rel.replace(/'/g, '') + "'";
-        const found = await stripeClient!.paymentIntents.search({
+        const found = await stripeDonations()!.paymentIntents.search({
             query: q, limit: 100, expand: ['data.latest_charge.balance_transaction'],
         });
         const rows: any[] = [];
