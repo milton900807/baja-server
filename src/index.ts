@@ -3559,6 +3559,21 @@ app.post(['/stripe/create-checkout-session', '/api/stripe/create-checkout-sessio
 // Nothing tells the campaign document that a donation succeeded: the total on the display is
 // what the organiser entered. A webhook on checkout.session.completed could raise it.
 const DONATION_CURRENCIES = ['usd', 'eur', 'gbp', 'cad', 'aud', 'chf', 'jpy'];
+// Opening the POST route in a browser is a GET, and Express answers a GET with no route by
+// saying "Cannot GET /stripe/donation-session" -- which looks exactly like the endpoint not
+// being deployed, whether or not it is. So the GET says what it actually is, and doubles as
+// the way to check a deploy landed and whether a Stripe key is configured.
+app.get(['/stripe/donation-session', '/api/stripe/donation-session'], (_req: any, res: any) => {
+    res.json({
+        ok: true,
+        endpoint: '/stripe/donation-session',
+        method: 'POST',
+        body: { amount: 'number', currency: DONATION_CURRENCIES, campaign: 'string', path: 'string', returnUrl: 'same-origin url', email: 'optional' },
+        stripeConfigured: !!stripeClient,
+        note: 'POST only. Payment methods are whatever is enabled on the Stripe account; this endpoint names none.',
+    });
+});
+
 app.post(['/stripe/donation-session', '/api/stripe/donation-session'], async (req: any, res: any) => {
     if (!stripeReady(res)) return;
     try {
