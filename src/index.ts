@@ -3716,6 +3716,105 @@ app.post(['/stripe/donation-sync', '/api/stripe/donation-sync'], async (req: any
     }
 });
 
+// EVERY CAMPAIGN A USER HAS, for the administration page (fundraise/admin.js). The folder
+// name under the user-data root is an AES encoding of the address, which the browser cannot
+// work out for itself, so the listing has to happen here.
+//
+// Only .fund documents in that user's own public folder, and only the summary the page shows.
+app.post(['/fundraise/campaigns', '/api/fundraise/campaigns'], (req: any, res: any) => {
+    try {
+        const who = ('' + ((req.body && req.body.user) || '')).trim();
+        if (!who) return res.status(400).json({ error: 'no_user' });
+        const enc = encodeEmail(who);
+        const dir = path.join(userData, enc, 'public');
+        if (!fs.existsSync(dir)) return res.json({ ok: true, campaigns: [] });
+        const out: any[] = [];
+        for (const name of fs.readdirSync(dir)) {
+            if (!/\.fund$/i.test(name)) continue;
+            const full = path.join(dir, name);
+            let d: any = null, st: any = null;
+            try { st = fs.statSync(full); d = JSON.parse(fs.readFileSync(full, 'utf-8')); } catch (e) { d = null; }
+            if (!d || typeof d !== 'object') continue;
+            const gifts = Array.isArray(d.gifts) ? d.gifts : [];
+            out.push({
+                file: name,
+                path: '/' + enc + '/public/' + name,
+                title: d.title || name.replace(/\.fund$/i, ''),
+                subtitle: d.subtitle || '',
+                currency: d.currency || 'USD',
+                goal: +d.goal || 0,
+                raised: +d.raised || 0,
+                donors: +d.donors || 0,
+                gifts: gifts.length,
+                fromStripe: gifts.filter((g: any) => g && g.via === 'stripe').length,
+                updates: Array.isArray(d.updates) ? d.updates.length : 0,
+                donateOn: !!(d.donate && d.donate.on),
+                donateMode: (d.donate && d.donate.mode) || '',
+                showNames: !!(d.donate && d.donate.showNames),
+                updated: d.updated || (st ? new Date(st.mtimeMs).toISOString() : ''),
+            });
+        }
+        out.sort((a, b) => ('' + b.updated).localeCompare('' + a.updated));
+        return res.json({ ok: true, campaigns: out });
+    } catch (e: any) {
+        return res.status(500).json({ error: 'list_failed', error_description: e?.message || String(e) });
+    }
+});
+
+// WHAT THE CAMPAIGN ACTUALLY BANKED. The display's total is GROSS -- what donors gave -- and
+// the bank receives that minus Stripe's cut, so the wall number and the accounts never agree
+// and should not be expected to. This reports both, per donation and in total, which is the
+// number to reconcile against a payout.
+//
+// Payment intents are SEARCHED by the campaign path in their metadata rather than listed and
+// filtered here, so a busy account does not hide one campaign's donations behind a hundred of
+// something else's. Stripe's search index lags reality by up to a minute, so a donation from
+// seconds ago can be missing from this while already being on the display (which comes from
+// the campaign document, not from here). The fee comes from each charge's balance
+// transaction, which is the only place Stripe states it.
+app.post(['/stripe/donation-report', '/api/stripe/donation-report'], async (req: any, res: any) => {
+    if (!stripeReady(res)) return;
+    try {
+        const rel = ('' + ((req.body && req.body.path) || '')).trim();
+        if (!rel || !/\.fund$/i.test(rel)) return res.status(400).json({ error: 'bad_path' });
+        const q = "metadata['campaignPath']:'" + rel.replace(/'/g, '') + "'";
+        const found = await stripeClient!.paymentIntents.search({
+            query: q, limit: 100, expand: ['data.latest_charge.balance_transaction'],
+        });
+        const rows: any[] = [];
+        let gross = 0, fees = 0, net = 0, currency = '';
+        for (const pi of found.data) {
+            if (pi.status !== 'succeeded') continue;
+            const ch: any = pi.latest_charge;
+            const bt: any = ch && ch.balance_transaction;
+            const cur = ('' + (pi.currency || 'usd')).toLowerCase();
+            const minor = (cur === 'jpy') ? 1 : 100;
+            const g = (pi.amount_received || pi.amount || 0) / minor;
+            const f = bt ? (bt.fee || 0) / minor : 0;
+            const n = bt ? (bt.net || 0) / minor : (g - f);
+            currency = currency || cur;
+            gross += g; fees += f; net += n;
+            rows.push({
+                id: pi.id,
+                at: new Date((pi.created || 0) * 1000).toISOString(),
+                currency: cur, gross: g, fee: f, net: n,
+                name: (ch && ch.billing_details && ch.billing_details.name) || '',
+                email: (ch && ch.billing_details && ch.billing_details.email) || '',
+                receipt: (ch && ch.receipt_url) || '',
+                status: pi.status,
+            });
+        }
+        rows.sort((a, b) => ('' + b.at).localeCompare('' + a.at));
+        return res.json({
+            ok: true, path: rel, currency: currency || 'usd', count: rows.length,
+            gross: gross, fees: fees, net: net, rows: rows,
+            truncated: !!found.has_more,
+        });
+    } catch (e: any) {
+        return res.status(500).json({ error: 'stripe_error', error_description: e?.message || String(e) });
+    }
+});
+
 // Open the Stripe billing portal (manage / cancel subscription); returns { url }.
 app.post(['/stripe/portal', '/api/stripe/portal'], async (req: any, res: any) => {
     if (!stripeReady(res)) return;
