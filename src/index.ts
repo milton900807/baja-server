@@ -3716,6 +3716,35 @@ app.post(['/stripe/donation-sync', '/api/stripe/donation-sync'], async (req: any
     }
 });
 
+// WHO MAY SEE THE FUNDRAISING ADMINISTRATION. The two routes below are not like the rest of
+// the fundraising endpoints: the campaign list and the donation report carry the money, the
+// fees and the donors' own names and email addresses, where the display and the sync carry
+// only what a campaign already publishes. So these two are restricted to the accounts named
+// in FUNDRAISE_ADMINS (comma-separated; jeffmilto@gmail.com when the variable is unset).
+//
+// WHAT THIS IS WORTH, PLAINLY. This server has no session store and no token verification:
+// a request says who it is by putting an email in the body and the server believes it, which
+// the access-control note at the top of this file says in as many words. So this is account
+// gating of the same kind as the rest of the platform, and it keeps the wrong signed-in user
+// out of the page. It is NOT authentication, and anyone willing to edit a request can claim
+// an address. Making it more means verifying the OIDC id_token on every request.
+//
+// It is registered as middleware ABOVE the routes it protects, because Express runs
+// handlers in the order they were added.
+const FUNDRAISE_ADMINS = ('' + (process.env.FUNDRAISE_ADMINS || 'jeffmilto@gmail.com'))
+    .split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
+app.use(['/fundraise/campaigns', '/api/fundraise/campaigns', '/stripe/donation-report', '/api/stripe/donation-report'],
+    (req: any, res: any, next: any) => {
+        const who = ('' + ((req.body && (req.body.user || req.body.email)) || req.query.user || '')).trim().toLowerCase();
+        if (who && FUNDRAISE_ADMINS.indexOf(who) >= 0) return next();
+        return res.status(403).json({
+            error: 'not_an_admin',
+            error_description: who
+                ? 'This account cannot see the fundraising administration.'
+                : 'Sign in to see the fundraising administration.',
+        });
+    });
+
 // EVERY CAMPAIGN A USER HAS, for the administration page (fundraise/admin.js). The folder
 // name under the user-data root is an AES encoding of the address, which the browser cannot
 // work out for itself, so the listing has to happen here.
