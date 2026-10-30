@@ -3815,6 +3815,46 @@ app.get('/f/:code', (req: any, res: any) => {
         + '</body></html>');
 });
 
+// WHICH WAYS TO PAY A DONOR WILL ACTUALLY BE OFFERED.
+//
+// None of this is decided here. The donation session names no payment_method_types, so the
+// list is whatever the Stripe account has turned on and whatever the donor's device and
+// country support. Apple Pay in particular needs nothing from this code: the domain
+// registration Stripe asks for covers Elements and the embedded form, not the hosted page
+// we redirect to, and the button then appears by itself for a donor in Safari with a card
+// in their wallet.
+//
+// Which leaves one honest question -- is it on? -- that was previously answerable only by
+// opening the Stripe dashboard. This reports what the account has configured, so the console
+// can say so, and a wallet that is off is a setting to change rather than a mystery.
+app.get(['/stripe/payment-methods', '/api/stripe/payment-methods'], async (_req: any, res: any) => {
+    if (!stripeReady(res)) return;
+    try {
+        const list = await stripeClient!.paymentMethodConfigurations.list({ limit: 20 });
+        const cfg: any = list.data.filter((c: any) => c.is_default)[0] || list.data[0];
+        if (!cfg) return res.json({ ok: true, configured: false, on: [], off: [] });
+        // A configuration holds one entry per method, each with a display preference. The
+        // names are Stripe's; only the spelling is ours.
+        const NICE: { [k: string]: string } = {
+            card: 'Card', apple_pay: 'Apple Pay', google_pay: 'Google Pay', link: 'Link',
+            cashapp: 'Cash App Pay', klarna: 'Klarna', affirm: 'Affirm', afterpay_clearpay: 'Afterpay',
+            us_bank_account: 'US bank account', sepa_debit: 'SEPA Direct Debit', acss_debit: 'Canadian pre-authorised debit',
+            bacs_debit: 'Bacs Direct Debit', amazon_pay: 'Amazon Pay', paypal: 'PayPal', alipay: 'Alipay',
+            wechat_pay: 'WeChat Pay', revolut_pay: 'Revolut Pay', ideal: 'iDEAL', bancontact: 'Bancontact',
+        };
+        const on: string[] = [], off: string[] = [];
+        for (const key of Object.keys(NICE)) {
+            const entry: any = cfg[key];
+            if (!entry || !entry.display_preference) continue;
+            const pref = '' + (entry.display_preference.value || entry.display_preference.preference || '');
+            (pref === 'on' || pref === 'auto' ? on : off).push(NICE[key]);
+        }
+        return res.json({ ok: true, configured: true, name: cfg.name || '', on: on, off: off });
+    } catch (e: any) {
+        return res.status(500).json({ error: 'stripe_error', error_description: e?.message || String(e) });
+    }
+});
+
 // WHO MAY SEE THE FUNDRAISING ADMINISTRATION. The two routes below are not like the rest of
 // the fundraising endpoints: the campaign list and the donation report carry the money, the
 // fees and the donors' own names and email addresses, where the display and the sync carry
