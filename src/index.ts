@@ -3538,6 +3538,89 @@ app.post(['/stripe/create-checkout-session', '/api/stripe/create-checkout-sessio
     }
 });
 
+// A DONATION to a fundraising campaign: a one-off Checkout session for an amount the donor
+// chose on the public display (manchester/viewer-fundraise.js).
+//
+// This endpoint is deliberately PUBLIC -- the display it serves is open without a sign-in, and
+// a donation page that demands an account is a donation page nobody uses. What that costs us
+// is bounded on purpose:
+//   * the amount is clamped and the currency comes from a fixed list, so a crafted request
+//     cannot charge an arbitrary figure or an unsupported currency;
+//   * it creates a Checkout session and nothing else -- no customer, no record of our own, no
+//     write anywhere. An abusive caller gets unpaid sessions, which expire;
+//   * the return URL is checked against this server's own origin, so the endpoint cannot be
+//     used to bounce someone to another site wearing a Stripe-looking link.
+//
+// payment_method_types is NOT passed, which is the point: Stripe then offers every method
+// enabled on the account that is eligible for the amount, currency and country -- card, Apple
+// Pay, Google Pay, Link, Cash App, Klarna, bank debits. Turning one on in the dashboard turns
+// it on for donors with no change here.
+//
+// Nothing tells the campaign document that a donation succeeded: the total on the display is
+// what the organiser entered. A webhook on checkout.session.completed could raise it.
+const DONATION_CURRENCIES = ['usd', 'eur', 'gbp', 'cad', 'aud', 'chf', 'jpy'];
+app.post(['/stripe/donation-session', '/api/stripe/donation-session'], async (req: any, res: any) => {
+    if (!stripeReady(res)) return;
+    try {
+        const { amount, currency, campaign, path: campaignPath, returnUrl, email } = req.body || {};
+        const cur = String(currency || 'usd').toLowerCase();
+        if (DONATION_CURRENCIES.indexOf(cur) < 0) return res.status(400).json({ error: 'bad_currency' });
+        const amt = Number(amount);
+        if (!isFinite(amt) || amt <= 0) return res.status(400).json({ error: 'bad_amount' });
+        // Zero-decimal currencies (JPY) are charged in whole units; everything else in cents.
+        const zeroDec = (cur === 'jpy');
+        const minor = Math.round(amt * (zeroDec ? 1 : 100));
+        const floor = zeroDec ? 100 : 100;                 // ~1 unit, under Stripe's own minimum otherwise
+        const ceiling = zeroDec ? 10000000 : 100000000;    // 10m yen / 1m dollars: a typo guard, not a policy
+        if (minor < floor) return res.status(400).json({ error: 'amount_too_small' });
+        if (minor > ceiling) return res.status(400).json({ error: 'amount_too_large' });
+
+        // Where the donor is sent back to. Only this server's own origin is accepted: an
+        // open redirect here would be handed out by Stripe itself.
+        const origin = String(req.headers.origin || '').replace(/\/$/, '');
+        let back = origin ? origin + '/' : '';
+        if (returnUrl) {
+            try {
+                const u = new URL(String(returnUrl));
+                const o = origin ? new URL(origin) : null;
+                if (o && u.protocol === o.protocol && u.host === o.host) back = u.toString();
+            } catch (e) { /* keep the origin */ }
+        }
+        if (!back) return res.status(400).json({ error: 'no_return_url' });
+        const sep = back.indexOf('?') >= 0 ? '&' : '?';
+
+        const name = String(campaign || '').slice(0, 120).trim();
+        const session = await stripeClient!.checkout.sessions.create({
+            mode: 'payment',
+            submit_type: 'donate',
+            // No payment_method_types: see above. Every method enabled on the account shows.
+            line_items: [{
+                quantity: 1,
+                price_data: {
+                    currency: cur,
+                    unit_amount: minor,
+                    product_data: { name: name ? ('Donation — ' + name) : 'Donation' },
+                },
+            }],
+            ...(email ? { customer_email: String(email).slice(0, 200) } : {}),
+            metadata: {
+                kind: 'fundraise-donation',
+                campaign: name,
+                campaignPath: String(campaignPath || '').slice(0, 300),
+            },
+            payment_intent_data: {
+                description: name ? ('Donation to ' + name) : 'Donation',
+                metadata: { kind: 'fundraise-donation', campaign: name, campaignPath: String(campaignPath || '').slice(0, 300) },
+            },
+            success_url: back + sep + 'donated=1',
+            cancel_url: back,
+        });
+        return res.json({ url: session.url, id: session.id });
+    } catch (e: any) {
+        return res.status(500).json({ error: 'stripe_error', error_description: e?.message || String(e) });
+    }
+});
+
 // Open the Stripe billing portal (manage / cancel subscription); returns { url }.
 app.post(['/stripe/portal', '/api/stripe/portal'], async (req: any, res: any) => {
     if (!stripeReady(res)) return;
