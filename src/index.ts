@@ -4092,12 +4092,12 @@ app.get(['/campaigns', '/campaigns/'], (req: any, res: any) => {
     // The tiles are rendered here AND rebuilt by the script below from /campaigns.json, so
     // the page is complete before any JavaScript runs -- a crawler, a reader with scripting
     // off and a slow phone all get the list -- and then keeps itself current.
-    const meta = (c: any, pct: number) => {
-        const bits: string[] = [];
-        if (+c.donors > 0) bits.push(c.donors + (c.donors === 1 ? ' donor' : ' donors'));
-        if (+c.goal > 0) bits.push(pct + '%');
-        return bits.length ? '<span class="meta">' + bits.join(' · ') + '</span>' : '';
-    };
+    // NOT the donor count. On a tile it reads as a score, and the campaign with three
+    // donors is the one that most needs the next visitor to open it rather than scroll
+    // past. Progress against the goal is the campaign's own measure and stays.
+    const meta = (c: any, pct: number) => (+c.goal > 0
+        ? '<span class="meta">' + pct + '%</span>'
+        : '');
     const card = (c: any) => {
         const pct = c.goal > 0 ? Math.max(0, Math.min(100, Math.round((c.raised / c.goal) * 100))) : 0;
         return '<a class="tile" href="/f/' + e(c.code) + '">'
@@ -4144,6 +4144,12 @@ app.get(['/campaigns', '/campaigns/'], (req: any, res: any) => {
         + '.wrap{max-width:1180px;margin:0 auto;padding:28px 18px 56px}'
         + 'header{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:2px}'
         + '.sub{color:#cfe0f0;font:500 16px/1.5 system-ui;margin:0;max-width:62ch}'
+        // The vetting note. Quiet rather than loud: it is a standard, and a standard shouted
+        // reads as a defence. A tick, one line, under the sentence it qualifies.
+        + '.vet{display:flex;gap:9px;align-items:flex-start;margin:14px 0 0;padding:10px 13px;'
+        + 'border:1px solid rgba(134,239,172,0.28);background:rgba(34,197,94,0.08);border-radius:10px;'
+        + 'color:#bfe6cd;font:400 13px/1.55 system-ui;max-width:72ch}'
+        + '.vet svg{flex:0 0 auto;margin-top:1px}'
         + '.acts{margin-left:auto;display:flex;align-items:center;gap:10px}'
         + '.go{display:inline-block;background:var(--go);color:#04210f;text-decoration:none;'
         + 'font:800 14px system-ui;padding:11px 18px;border-radius:11px}'
@@ -4183,7 +4189,18 @@ app.get(['/campaigns', '/campaigns/'], (req: any, res: any) => {
         // No heading. The page is the list, the tab already says Campaigns, and a word
         // repeated above a grid of campaigns is a line of nothing. The sentence that
         // remains says something: how many there are and what they have raised.
-        + '<header><div><p class="sub" id="sub">' + e(desc) + '</p></div>'
+        + '<header><div><p class="sub" id="sub">' + e(desc) + '</p>'
+        // WHAT A READER IS BEING TOLD. Somebody deciding whether to give to a stranger's
+        // campaign about a disease they have never heard of has no way to judge the science
+        // in it. This says who did.
+        + '<p class="vet">'
+        + '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#86efac" stroke-width="2.4" '
+        + 'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+        + '<path d="M20 6 9 17l-5-5"/></svg>'
+        + '<span>Every campaign here is reviewed for scientific merit before it is listed. '
+        + 'Gene.Clinic removes anything it judges to be pseudoscience, not science at all, or '
+        + 'a promise of a cure, and may refuse or unlist a campaign at its own discretion.'
+        + '</span></p></div>'
         + '<span class="acts" id="acts"><a class="plain" href="/login">Log in</a>'
         + '<a class="go" href="/login">Start a campaign</a></span></header>'
         + (list.length ? '<div class="tools">'
@@ -4211,8 +4228,9 @@ app.get(['/campaigns', '/campaigns/'], (req: any, res: any) => {
         + '+\'<span class="nums"><b>\'+esc(money(c.raised,c.currency))+\'</b>\'+(c.goal>0?\'<i>of \'+esc(money(c.goal,c.currency))+\'</i>\':\'<i>raised</i>\')+\'</span>\''
         + '+(c.goal>0?\'<span class="bar"><span style="width:\'+p+\'%"></span></span>\':"")'
         + '+meta(c,p)+\'</span></a>\'}'
-        + 'function meta(c,p){var b=[];if(c.donors>0)b.push(c.donors+(c.donors===1?" donor":" donors"));'
-        + 'if(c.goal>0)b.push(p+"%");return b.length?\'<span class="meta">\'+b.join(" · ")+"</span>":""}'
+        // The same rule as the server's meta(): no donor count. The two have to agree, or
+        // searching the page quietly puts back what the first render left out.
+        + 'function meta(c,p){return c.goal>0?\'<span class="meta">\'+p+"%</span>":""}'
         + 'function draw(){var q=(document.getElementById("q")||{}).value||"";q=q.trim().toLowerCase();'
         + 'var s=(document.getElementById("sort")||{}).value||"updated";'
         + 'var l=DATA.filter(function(c){return !q||((c.title+" "+(c.blurb||"")).toLowerCase().indexOf(q)>=0)});'
@@ -4311,7 +4329,7 @@ app.post(['/fundraise/all-file', '/api/fundraise/all-file'], (req: any, res: any
         // matters is that there is no separator and no dot in it. The resolve check below
         // is what actually keeps the write inside the folder.
         if (!/^[A-Za-z0-9_-]+$/.test(enc)) return res.status(400).json({ error: 'bad_account' });
-        if (!/^[A-Za-z0-9._-]+\.(fund|fundimg|fundteam)$/.test(name) || name.indexOf('..') >= 0)
+        if (!/^[A-Za-z0-9._-]+\.(fund|fundimg|fundteam|funddoc)$/.test(name) || name.indexOf('..') >= 0)
             return res.status(400).json({ error: 'bad_name' });
         const dir = path.join(userData, enc, 'public');
         const full = path.join(dir, name);
@@ -4324,7 +4342,7 @@ app.post(['/fundraise/all-file', '/api/fundraise/all-file'], (req: any, res: any
             const base = name.replace(/\.fund$/i, '');
             // The picture and the team faces go with the campaign. Nothing else points at
             // them once it is gone, and left behind they are orphans nobody will ever find.
-            const also = /\.fund$/i.test(name) ? [name, base + '.fundimg', base + '.fundteam'] : [name];
+            const also = /\.fund$/i.test(name) ? [name, base + '.fundimg', base + '.fundteam', base + '.funddoc'] : [name];
             for (const f of also) {
                 const fp = path.join(dir, f);
                 try { if (fs.existsSync(fp)) { fs.unlinkSync(fp); gone++; } } catch (e) { }
@@ -4373,7 +4391,7 @@ const RETIRED_DIR = 'deleted-campaigns';
 const RETIRE_NAME = /^(\d{8}T\d{6}Z)__([A-Za-z0-9._-]+\.fund)$/;
 const campaignFiles = (name: string) => {
     const base = name.replace(/\.fund$/i, '');
-    return [name, base + '.fundimg', base + '.fundteam'];
+    return [name, base + '.fundimg', base + '.fundteam', base + '.funddoc'];
 };
 // A campaign path, picked apart and checked: one document directly inside one account's
 // own public folder, nothing that climbs out of it.
@@ -4734,13 +4752,13 @@ app.post(['/fundraise/edit-file', '/api/fundraise/edit-file'], (req: any, res: a
         const hit = splitCampaignPath('' + ((req.body && req.body.path) || ''));
         if (!hit) return res.status(400).json({ error: 'bad_path' });
         const name = ('' + ((req.body && req.body.name) || '')).trim();
-        if (!/^[A-Za-z0-9._-]+\.(fund|fundimg|fundteam)$/.test(name) || name.indexOf('..') >= 0)
+        if (!/^[A-Za-z0-9._-]+\.(fund|fundimg|fundteam|funddoc)$/.test(name) || name.indexOf('..') >= 0)
             return res.status(400).json({ error: 'bad_name' });
         // The file being written has to belong to the campaign that was shared: its own
         // document, or one of its two sidecars. Otherwise "share one campaign" would mean
         // "write anything into that folder".
         const stem = hit.name.replace(/\.fund$/i, '');
-        if (name !== hit.name && name !== stem + '.fundimg' && name !== stem + '.fundteam')
+        if (name !== hit.name && name !== stem + '.fundimg' && name !== stem + '.fundteam' && name !== stem + '.funddoc')
             return res.status(400).json({ error: 'not_that_campaign', error_description: 'That file is not part of the campaign you were given.' });
         if (!mayEditCampaign(who, hit.enc, hit.name)) {
             return res.status(403).json({
@@ -4779,10 +4797,10 @@ app.post(['/fundraise/read-file', '/api/fundraise/read-file'], (req: any, res: a
         const hit = splitCampaignPath('' + ((req.body && req.body.path) || ''));
         if (!hit) return res.status(400).json({ error: 'bad_path' });
         const name = ('' + ((req.body && req.body.name) || hit.name)).trim();
-        if (!/^[A-Za-z0-9._-]+\.(fund|fundimg|fundteam)$/.test(name) || name.indexOf('..') >= 0)
+        if (!/^[A-Za-z0-9._-]+\.(fund|fundimg|fundteam|funddoc)$/.test(name) || name.indexOf('..') >= 0)
             return res.status(400).json({ error: 'bad_name' });
         const stem = hit.name.replace(/\.fund$/i, '');
-        if (name !== hit.name && name !== stem + '.fundimg' && name !== stem + '.fundteam')
+        if (name !== hit.name && name !== stem + '.fundimg' && name !== stem + '.fundteam' && name !== stem + '.funddoc')
             return res.status(400).json({ error: 'not_that_campaign' });
         if (!mayEditCampaign(who, hit.enc, hit.name))
             return res.status(403).json({ error: 'not_shared_with_you', error_description: 'That campaign has not been shared with this account.' });
