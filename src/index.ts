@@ -3993,6 +3993,215 @@ app.use(['/stripe/donation-report', '/api/stripe/donation-report'],
         });
     });
 
+// EVERY PUBLISHED CAMPAIGN, ON ONE PAGE: https://gene.clinic/campaigns
+//
+// Server-rendered on purpose. It is the only page here a stranger arrives at without
+// being sent a link, so it has to be fast, has to work with no account and no JavaScript
+// framework between the visitor and the list, and has to carry its own preview card when
+// somebody shares the directory itself. It also means this ships with the API rather than
+// waiting on a front-end build.
+//
+// WHAT COUNTS AS PUBLISHED. The share-alias table is the index: a campaign gets an entry
+// the moment it is published, and nothing else does. So the list is built by walking that
+// table rather than the file system, which means a draft in somebody's folder that has
+// never been shared is not here, and nothing has to decide what "published" means twice.
+//
+// The pictures come from /f/<code>/i, which already serves a campaign's own image with the
+// awareness ribbon as its fallback, and is already cached.
+const CAMPAIGNS_TTL = 30 * 1000;
+let __campaignsCache: { at: number; list: any[] } = { at: 0, list: [] };
+
+function campaignIndex(): any[] {
+    const now = Date.now();
+    if (__campaignsCache.at && (now - __campaignsCache.at) < CAMPAIGNS_TTL) return __campaignsCache.list;
+    const out: any[] = [];
+    const seen: { [rel: string]: boolean } = {};
+    try {
+        const aliases = loadShareAliases() || {};
+        const rootDir = path.resolve(userData);
+        for (const code of Object.keys(aliases)) {
+            const rel = ('' + (aliases[code] || '')).trim();
+            if (!rel || !/\.fund$/i.test(rel) || seen[rel]) continue;
+            const file = path.resolve(rootDir, rel.replace(/^\/+/, ''));
+            if (file !== rootDir && !file.startsWith(rootDir + path.sep)) continue;
+            let d: any = null, st: any = null;
+            try { st = fs.statSync(file); d = JSON.parse(fs.readFileSync(file, 'utf-8')); } catch (e) { d = null; }
+            if (!d || typeof d !== 'object') continue;
+            if (d.kind && d.kind !== 'fundraise') continue;
+            if (d.unlisted === true) continue;          // a campaign can ask to stay off this page
+            seen[rel] = true;
+            const story = ('' + (d.subtitle || d.note || d.story || '')).replace(/\s+/g, ' ').trim();
+            out.push({
+                code: code,
+                title: ('' + (d.title || 'A campaign')).slice(0, 120),
+                blurb: story.slice(0, 160),
+                currency: ('' + (d.currency || 'USD')).toUpperCase(),
+                raised: +d.raised || 0,
+                goal: +d.goal || 0,
+                donors: +d.donors || 0,
+                image: !!(d.media && d.media.imageFile),
+                updated: d.updated || (st ? new Date(st.mtimeMs).toISOString() : ''),
+            });
+        }
+    } catch (e) { /* an unreadable index is an empty page, not a 500 */ }
+    out.sort((a, b) => ('' + b.updated).localeCompare('' + a.updated));
+    __campaignsCache = { at: now, list: out };
+    return out;
+}
+
+// The data behind the page, so the tiles can refresh themselves without a reload and so
+// anything else can read the directory.
+app.get(['/campaigns.json', '/api/campaigns.json'], (_req: any, res: any) => {
+    const list = campaignIndex();
+    res.setHeader('Cache-Control', 'public, max-age=30');
+    res.json({
+        ok: true,
+        count: list.length,
+        raised: list.reduce((a: number, c: any) => a + (+c.raised || 0), 0),
+        donors: list.reduce((a: number, c: any) => a + (+c.donors || 0), 0),
+        campaigns: list,
+    });
+});
+
+app.get(['/campaigns', '/campaigns/'], (req: any, res: any) => {
+    const host = ('' + (req.headers['x-forwarded-host'] || req.headers.host || '')).split(',')[0].trim();
+    const proto = ('' + (req.headers['x-forwarded-proto'] || 'https')).split(',')[0].trim();
+    const base = proto + '://' + host;
+    const list = campaignIndex();
+    const e = (t: any) => ('' + (t == null ? '' : t)).replace(/[&<>"]/g, (c: string) =>
+        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' } as any)[c]);
+    const total = list.reduce((a: number, c: any) => a + (+c.raised || 0), 0);
+    const cur = (list[0] && list[0].currency) || 'USD';
+    const money = (n: number, c?: string) => {
+        try { return new Intl.NumberFormat('en-US', { style: 'currency', currency: (c || cur), maximumFractionDigits: 0 }).format(n); }
+        catch (x) { return '' + Math.round(n); }
+    };
+    const desc = list.length
+        ? (list.length + (list.length === 1 ? ' campaign' : ' campaigns') + ' raising money for rare disease, '
+            + money(total) + ' raised so far. No charge to run one, and no share of what you raise.')
+        : 'Campaigns raising money for rare disease. No charge to run one, and no share of what you raise.';
+
+    // The tiles are rendered here AND rebuilt by the script below from /campaigns.json, so
+    // the page is complete before any JavaScript runs -- a crawler, a reader with scripting
+    // off and a slow phone all get the list -- and then keeps itself current.
+    const card = (c: any) => {
+        const pct = c.goal > 0 ? Math.max(0, Math.min(100, Math.round((c.raised / c.goal) * 100))) : 0;
+        return '<a class="tile" href="/f/' + e(c.code) + '">'
+            + '<span class="shot" style="background-image:url(/f/' + e(c.code) + '/i)"></span>'
+            + '<span class="body">'
+            + '<span class="t">' + e(c.title) + '</span>'
+            + (c.blurb ? '<span class="b">' + e(c.blurb) + '</span>' : '')
+            + '<span class="nums"><b>' + e(money(c.raised, c.currency)) + '</b>'
+            + (c.goal > 0 ? '<i>of ' + e(money(c.goal, c.currency)) + '</i>' : '<i>raised</i>') + '</span>'
+            + (c.goal > 0 ? '<span class="bar"><span style="width:' + pct + '%"></span></span>' : '')
+            + '<span class="meta">' + (c.donors > 0 ? (c.donors + (c.donors === 1 ? ' donor' : ' donors')) : 'Be the first to give')
+            + (c.goal > 0 ? ' · ' + pct + '%' : '') + '</span>'
+            + '</span></a>';
+    };
+    const empty = '<div class="empty"><div class="eh">No campaigns yet</div>'
+        + '<p>The first one published appears here. Starting one is free, and nothing is taken from what it raises.</p>'
+        + '<a class="go" href="/login">Start a campaign</a></div>';
+
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=60');
+    res.end('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+        + '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        + '<title>Campaigns · gene.clinic</title>'
+        + '<meta name="description" content="' + e(desc) + '">'
+        + '<meta property="og:type" content="website">'
+        + '<meta property="og:site_name" content="gene.clinic">'
+        + '<meta property="og:title" content="Campaigns raising money for rare disease">'
+        + '<meta property="og:description" content="' + e(desc) + '">'
+        + '<meta property="og:url" content="' + e(base + '/campaigns') + '">'
+        + (list[0] ? '<meta property="og:image" content="' + e(base + '/f/' + list[0].code + '/i') + '">' : '')
+        + '<meta name="twitter:card" content="summary_large_image">'
+        + '<link rel="icon" type="image/svg+xml" href="/assets/logos/baja-logo.svg">'
+        + '<style>'
+        + ':root{--ink:#eaf6f9;--dim:#9fb3c8;--line:rgba(255,255,255,.14);--go:#16c47f}'
+        + '*{box-sizing:border-box}'
+        + 'body{margin:0;min-height:100vh;color:var(--ink);background:'
+        + 'radial-gradient(1200px 600px at 12% -10%,rgba(22,196,127,.22),transparent 60%),'
+        + 'radial-gradient(1000px 600px at 110% 8%,rgba(18,167,232,.22),transparent 55%),'
+        + 'radial-gradient(900px 700px at 50% 120%,rgba(255,140,26,.16),transparent 55%),#071b2a;'
+        + 'font:16px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif}'
+        + '.wrap{max-width:1180px;margin:0 auto;padding:28px 18px 56px}'
+        + 'header{display:flex;align-items:flex-end;gap:16px;flex-wrap:wrap;margin-bottom:6px}'
+        + 'h1{font:800 30px/1.15 system-ui;margin:0}'
+        + '.sub{color:var(--dim);font-size:14px;margin:6px 0 0}'
+        + '.go{display:inline-block;margin-left:auto;background:var(--go);color:#04210f;text-decoration:none;'
+        + 'font:800 14px system-ui;padding:11px 18px;border-radius:11px}'
+        + '.go:hover{filter:brightness(1.07)}'
+        + '.tools{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0 16px}'
+        + 'input,select{background:rgba(255,255,255,.06);color:var(--ink);border:1px solid var(--line);'
+        + 'border-radius:10px;padding:10px 12px;font:15px system-ui;min-height:44px}'
+        + 'input{flex:1 1 260px}'
+        + '.grid{display:grid;gap:16px;grid-template-columns:repeat(auto-fill,minmax(260px,1fr))}'
+        + '.tile{display:flex;flex-direction:column;text-decoration:none;color:inherit;overflow:hidden;'
+        + 'border:1px solid var(--line);border-radius:16px;background:rgba(255,255,255,.04);'
+        + 'transition:transform .15s ease,box-shadow .15s ease,border-color .15s ease}'
+        + '.tile:hover{transform:translateY(-3px);border-color:rgba(22,196,127,.5);box-shadow:0 14px 34px rgba(0,0,0,.4)}'
+        + '.shot{display:block;height:146px;background:#0b2234 center/cover no-repeat}'
+        + '.body{display:flex;flex-direction:column;gap:7px;padding:14px 15px 16px}'
+        + '.t{font:700 16px system-ui}'
+        + '.b{color:var(--dim);font-size:13.5px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}'
+        + '.nums{display:flex;align-items:baseline;gap:7px}'
+        + '.nums b{font:800 19px system-ui}.nums i{color:var(--dim);font-style:normal;font-size:13px}'
+        + '.bar{display:block;height:6px;border-radius:99px;background:rgba(255,255,255,.12);overflow:hidden}'
+        + '.bar>span{display:block;height:100%;background:linear-gradient(90deg,#16c47f,#12a7e8)}'
+        + '.meta{color:var(--dim);font-size:12.5px}'
+        + '.empty{border:1px solid var(--line);border-radius:16px;padding:42px 22px;text-align:center;background:rgba(255,255,255,.03)}'
+        + '.eh{font:800 20px system-ui}.empty p{color:var(--dim);max-width:46ch;margin:10px auto 18px}'
+        + '.empty .go{margin:0}'
+        + 'footer{color:var(--dim);font-size:13px;margin-top:30px;text-align:center}'
+        + 'footer a{color:#7fd7ea}'
+        + '@media (max-width:520px){h1{font-size:24px}.go{margin-left:0}.shot{height:128px}}'
+        + '</style></head><body><div class="wrap">'
+        + '<header><div><h1>Campaigns</h1>'
+        + '<p class="sub" id="sub">' + e(desc) + '</p></div>'
+        + '<a class="go" href="/login">Start a campaign</a></header>'
+        + (list.length ? '<div class="tools">'
+            + '<input id="q" type="search" placeholder="Search campaigns" aria-label="Search campaigns">'
+            + '<select id="sort" aria-label="Order">'
+            + '<option value="updated">Most recent</option>'
+            + '<option value="raised">Most raised</option>'
+            + '<option value="progress">Closest to goal</option>'
+            + '<option value="title">By name</option></select></div>' : '')
+        + '<div class="grid" id="grid">' + (list.length ? list.map(card).join('') : empty) + '</div>'
+        + '<footer>No charge to run a campaign, and no share of what you raise. '
+        + '<a href="/login">Start one</a>.</footer>'
+        + '</div><script>'
+        // The tiles are already on the page. This re-sorts and filters them without asking
+        // the server, and re-reads the list once a minute so a total that moves while the
+        // page is open moves here too.
+        + 'var DATA=' + JSON.stringify(list) + ';'
+        + 'var cur=' + JSON.stringify(cur) + ';'
+        + 'function money(n,c){try{return new Intl.NumberFormat("en-US",{style:"currency",currency:c||cur,maximumFractionDigits:0}).format(n)}catch(e){return Math.round(n)}}'
+        + 'function esc(t){return String(t==null?"":t).replace(/[&<>"]/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}[c]})}'
+        + 'function card(c){var p=c.goal>0?Math.max(0,Math.min(100,Math.round(c.raised/c.goal*100))):0;'
+        + 'return \'<a class="tile" href="/f/\'+esc(c.code)+\'"><span class="shot" style="background-image:url(/f/\'+esc(c.code)+\'/i)"></span>\''
+        + '+\'<span class="body"><span class="t">\'+esc(c.title)+\'</span>\''
+        + '+(c.blurb?\'<span class="b">\'+esc(c.blurb)+\'</span>\':"")'
+        + '+\'<span class="nums"><b>\'+esc(money(c.raised,c.currency))+\'</b>\'+(c.goal>0?\'<i>of \'+esc(money(c.goal,c.currency))+\'</i>\':\'<i>raised</i>\')+\'</span>\''
+        + '+(c.goal>0?\'<span class="bar"><span style="width:\'+p+\'%"></span></span>\':"")'
+        + '+\'<span class="meta">\'+(c.donors>0?(c.donors+(c.donors===1?" donor":" donors")):"Be the first to give")+(c.goal>0?" · "+p+"%":"")+\'</span></span></a>\'}'
+        + 'function draw(){var q=(document.getElementById("q")||{}).value||"";q=q.trim().toLowerCase();'
+        + 'var s=(document.getElementById("sort")||{}).value||"updated";'
+        + 'var l=DATA.filter(function(c){return !q||((c.title+" "+(c.blurb||"")).toLowerCase().indexOf(q)>=0)});'
+        + 'l.sort(function(a,b){if(s==="raised")return b.raised-a.raised;'
+        + 'if(s==="title")return String(a.title).localeCompare(String(b.title));'
+        + 'if(s==="progress"){var pa=a.goal>0?a.raised/a.goal:-1,pb=b.goal>0?b.raised/b.goal:-1;return pb-pa}'
+        + 'return String(b.updated).localeCompare(String(a.updated))});'
+        + 'var g=document.getElementById("grid");'
+        + 'g.innerHTML=l.length?l.map(card).join(""):\'<div class="empty"><div class="eh">Nothing matches that</div><p>Try fewer words.</p></div>\';}'
+        + 'var qi=document.getElementById("q"),si=document.getElementById("sort");'
+        + 'if(qi)qi.addEventListener("input",draw);if(si)si.addEventListener("change",draw);'
+        + 'setInterval(function(){fetch("/campaigns.json",{cache:"no-store"}).then(function(r){return r.json()}).then(function(j){'
+        + 'if(!j||!j.ok||!j.campaigns)return;DATA=j.campaigns;var s=document.getElementById("sub");'
+        + 'if(s&&j.count)s.textContent=j.count+(j.count===1?" campaign":" campaigns")+" raising money for rare disease, "+money(j.raised)+" raised so far.";'
+        + 'draw()}).catch(function(){})},60000);'
+        + '</script></body></html>');
+});
+
 // EVERY CAMPAIGN ON THE SERVER, for the superadmin page (fundraise/super.js).
 //
 // One folder per account under the user-data root, named with the AES encoding of the
