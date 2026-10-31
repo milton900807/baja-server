@@ -4125,12 +4125,18 @@ app.get(['/campaigns', '/campaigns/'], (req: any, res: any) => {
         + 'radial-gradient(900px 700px at 50% 120%,rgba(255,140,26,.16),transparent 55%),#071b2a;'
         + 'font:16px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif}'
         + '.wrap{max-width:1180px;margin:0 auto;padding:28px 18px 56px}'
-        + 'header{display:flex;align-items:flex-end;gap:16px;flex-wrap:wrap;margin-bottom:6px}'
-        + 'h1{font:800 30px/1.15 system-ui;margin:0}'
-        + '.sub{color:var(--dim);font-size:14px;margin:6px 0 0}'
-        + '.go{display:inline-block;margin-left:auto;background:var(--go);color:#04210f;text-decoration:none;'
+        + 'header{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:2px}'
+        + '.sub{color:#cfe0f0;font:500 16px/1.5 system-ui;margin:0;max-width:62ch}'
+        + '.acts{margin-left:auto;display:flex;align-items:center;gap:10px}'
+        + '.go{display:inline-block;background:var(--go);color:#04210f;text-decoration:none;'
         + 'font:800 14px system-ui;padding:11px 18px;border-radius:11px}'
         + '.go:hover{filter:brightness(1.07)}'
+        // Logging in and starting a campaign are the same door, so the two cannot look
+        // like the same button: one is the offer, the other is for somebody who already
+        // has a campaign and wants back into it.
+        + '.plain{display:inline-block;color:var(--ink);text-decoration:none;font:700 14px system-ui;'
+        + 'padding:10px 16px;border:1px solid var(--line);border-radius:11px}'
+        + '.plain:hover{border-color:rgba(255,255,255,.4);background:rgba(255,255,255,.05)}'
         + '.tools{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0 16px}'
         + 'input,select{background:rgba(255,255,255,.06);color:var(--ink);border:1px solid var(--line);'
         + 'border-radius:10px;padding:10px 12px;font:15px system-ui;min-height:44px}'
@@ -4154,11 +4160,15 @@ app.get(['/campaigns', '/campaigns/'], (req: any, res: any) => {
         + '.empty .go{margin:0}'
         + 'footer{color:var(--dim);font-size:13px;margin-top:30px;text-align:center}'
         + 'footer a{color:#7fd7ea}'
-        + '@media (max-width:520px){h1{font-size:24px}.go{margin-left:0}.shot{height:128px}}'
+        + '@media (max-width:520px){.sub{font-size:15px}.acts{margin-left:0;width:100%}'
+        + '.acts .go{flex:1 1 auto;text-align:center}.shot{height:128px}}'
         + '</style></head><body><div class="wrap">'
-        + '<header><div><h1>Campaigns</h1>'
-        + '<p class="sub" id="sub">' + e(desc) + '</p></div>'
-        + '<a class="go" href="/login">Start a campaign</a></header>'
+        // No heading. The page is the list, the tab already says Campaigns, and a word
+        // repeated above a grid of campaigns is a line of nothing. The sentence that
+        // remains says something: how many there are and what they have raised.
+        + '<header><div><p class="sub" id="sub">' + e(desc) + '</p></div>'
+        + '<span class="acts"><a class="plain" href="/login">Log in</a>'
+        + '<a class="go" href="/login">Start a campaign</a></span></header>'
         + (list.length ? '<div class="tools">'
             + '<input id="q" type="search" placeholder="Search campaigns" aria-label="Search campaigns">'
             + '<select id="sort" aria-label="Order">'
