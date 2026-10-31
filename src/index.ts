@@ -4141,7 +4141,7 @@ app.get(['/campaigns', '/campaigns/'], (req: any, res: any) => {
         + 'radial-gradient(1000px 600px at 110% 8%,rgba(18,167,232,.22),transparent 55%),'
         + 'radial-gradient(900px 700px at 50% 120%,rgba(255,140,26,.16),transparent 55%),#071b2a;'
         + 'font:16px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif}'
-        + '.wrap{max-width:1180px;margin:0 auto;padding:28px 18px 56px}'
+        + '.wrap{max-width:1180px;margin:0 auto;padding:28px 18px 56px;display:flex;flex-direction:column}'
         + 'header{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:2px}'
         + '.sub{color:#cfe0f0;font:500 16px/1.5 system-ui;margin:0;max-width:62ch}'
         // The vetting note. Quiet rather than loud: it is a standard, and a standard shouted
@@ -4184,15 +4184,24 @@ app.get(['/campaigns', '/campaigns/'], (req: any, res: any) => {
         + 'footer{color:var(--dim);font-size:13px;margin-top:30px;text-align:center}'
         + 'footer a{color:#7fd7ea}'
         + '@media (max-width:520px){.sub{font-size:15px}.acts{margin-left:0;width:100%}'
-        + '.acts .go{flex:1 1 auto;text-align:center}.shot{height:128px}}'
+        + '.acts .go{flex:1 1 auto;text-align:center}.shot{height:128px}'
+        // Last on a phone: it is a standard, not a greeting, and a screen this size has
+        // room for about one thing above the fold.
+        + '.vet{order:9;margin:26px 0 0}}'
         + '</style></head><body><div class="wrap">'
         // No heading. The page is the list, the tab already says Campaigns, and a word
         // repeated above a grid of campaigns is a line of nothing. The sentence that
         // remains says something: how many there are and what they have raised.
-        + '<header><div><p class="sub" id="sub">' + e(desc) + '</p>'
+        + '<header><div><p class="sub" id="sub">' + e(desc) + '</p></div>'
+        + '<span class="acts" id="acts"><a class="plain" href="/login">Log in</a>'
+        + '<a class="go" href="/login">Start a campaign</a></span></header>'
         // WHAT A READER IS BEING TOLD. Somebody deciding whether to give to a stranger's
         // campaign about a disease they have never heard of has no way to judge the science
         // in it. This says who did.
+        //
+        // A sibling of the header rather than a child of it, so that on a phone it can be
+        // ordered to the end of the page. There it would otherwise sit between somebody and
+        // the campaigns they came for, on a screen with room for about one thing.
         + '<p class="vet">'
         + '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#86efac" stroke-width="2.4" '
         + 'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
@@ -4200,9 +4209,7 @@ app.get(['/campaigns', '/campaigns/'], (req: any, res: any) => {
         + '<span>Every campaign here is reviewed for scientific merit before it is listed. '
         + 'Gene.Clinic removes anything it judges to be pseudoscience, not science at all, or '
         + 'a promise of a cure, and may refuse or unlist a campaign at its own discretion.'
-        + '</span></p></div>'
-        + '<span class="acts" id="acts"><a class="plain" href="/login">Log in</a>'
-        + '<a class="go" href="/login">Start a campaign</a></span></header>'
+        + '</span></p>'
         + (list.length ? '<div class="tools">'
             + '<input id="q" type="search" placeholder="Search campaigns" aria-label="Search campaigns">'
             + '<select id="sort" aria-label="Order">'
