@@ -3918,32 +3918,62 @@ app.get(['/stripe/payment-methods', '/api/stripe/payment-methods'], async (_req:
     }
 });
 
-// WHO MAY SEE THE FUNDRAISING ADMINISTRATION. The two routes below are not like the rest of
-// the fundraising endpoints: the campaign list and the donation report carry the money, the
-// fees and the donors' own names and email addresses, where the display and the sync carry
-// only what a campaign already publishes. So these two are restricted to the accounts named
-// in FUNDRAISE_ADMINS (comma-separated; jeffmilto@gmail.com when the variable is unset).
+// WHO MAY SEE A CAMPAIGN'S DONATIONS. Everyone who runs a campaign needs to see what theirs
+// raised and who gave, so the question is not WHETHER an account may look but WHOSE campaign
+// it is looking at.
+//
+// /fundraise/campaigns needs no gate at all: it lists the caller's own folder, found by
+// encoding the address it was given, and can return nobody else's campaigns however it is
+// called.
+//
+// /stripe/donation-report does, because it takes a campaign PATH and answers with the
+// donors' names, email addresses and receipts. So the path has to be one of the caller's
+// own: /<their encoded folder>/public/<something>.fund, which is the shape /fundraise/campaigns
+// hands out and the only shape a campaign document has. An account in FUNDRAISE_ADMINS may
+// ask for any campaign, which is what makes helping someone with theirs possible.
 //
 // WHAT THIS IS WORTH, PLAINLY. This server has no session store and no token verification:
 // a request says who it is by putting an email in the body and the server believes it, which
 // the access-control note at the top of this file says in as many words. So this is account
-// gating of the same kind as the rest of the platform, and it keeps the wrong signed-in user
-// out of the page. It is NOT authentication, and anyone willing to edit a request can claim
-// an address. Making it more means verifying the OIDC id_token on every request.
+// scoping of the same kind as the rest of the platform -- it keeps one signed-in user out of
+// another's donations -- and it is NOT authentication: anyone willing to edit a request can
+// claim an address. Making it more means verifying the OIDC id_token on every request. What
+// the check does buy, even as it stands, is that the folder name is an AES encoding of the
+// address, so claiming an address is not enough on its own to guess a path.
 //
-// It is registered as middleware ABOVE the routes it protects, because Express runs
-// handlers in the order they were added.
+// It is registered as middleware ABOVE the route it protects, because Express runs handlers
+// in the order they were added.
 const FUNDRAISE_ADMINS = ('' + (process.env.FUNDRAISE_ADMINS || 'jeffmilto@gmail.com'))
     .split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
-app.use(['/fundraise/campaigns', '/api/fundraise/campaigns', '/stripe/donation-report', '/api/stripe/donation-report'],
+app.use(['/stripe/donation-report', '/api/stripe/donation-report'],
     (req: any, res: any, next: any) => {
-        const who = ('' + ((req.body && (req.body.user || req.body.email)) || req.query.user || '')).trim().toLowerCase();
-        if (who && FUNDRAISE_ADMINS.indexOf(who) >= 0) return next();
+        const who = ('' + ((req.body && (req.body.user || req.body.email)) || req.query.user || '')).trim();
+        if (!who) {
+            return res.status(403).json({
+                error: 'not_signed_in',
+                error_description: 'Sign in to see the donations behind a campaign.',
+            });
+        }
+        if (FUNDRAISE_ADMINS.indexOf(who.toLowerCase()) >= 0) return next();
+        const rel = ('' + ((req.body && req.body.path) || '')).trim();
+        let mine = false;
+        try {
+            const enc = ('' + (encodeEmail(who) || '')).trim();
+            // One campaign document directly inside that account's own public folder, and
+            // nothing that climbs out of it: no second slash, no .. , nothing but a name.
+            if (enc) {
+                // Case-SENSITIVE on the folder: the encoding is ciphertext, where two
+                // different accounts can differ by nothing but the case of a letter, and a
+                // loose compare would hand one of them the other's donors.
+                const want = '/' + enc + '/public/';
+                const norm = rel.replace(/^\/+/, '/');
+                mine = norm.slice(0, want.length) === want && /^[^/]+\.fund$/i.test(norm.slice(want.length));
+            }
+        } catch (e) { mine = false; }
+        if (mine) return next();
         return res.status(403).json({
-            error: 'not_an_admin',
-            error_description: who
-                ? 'This account cannot see the fundraising administration.'
-                : 'Sign in to see the fundraising administration.',
+            error: 'not_your_campaign',
+            error_description: 'That campaign belongs to another account.',
         });
     });
 
