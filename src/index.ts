@@ -3945,6 +3945,22 @@ app.get(['/stripe/payment-methods', '/api/stripe/payment-methods'], async (_req:
 // in the order they were added.
 const FUNDRAISE_ADMINS = ('' + (process.env.FUNDRAISE_ADMINS || 'jeffmilto@gmail.com'))
     .split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
+//
+// The two /fundraise/all-* routes below are a different matter again: they cross accounts
+// by design -- every campaign on the box, and writing into somebody else's folder -- so
+// they are admins only, with no owner path to fall back on.
+app.use(['/fundraise/all-campaigns', '/api/fundraise/all-campaigns',
+         '/fundraise/all-file', '/api/fundraise/all-file'],
+    (req: any, res: any, next: any) => {
+        const who = ('' + ((req.body && (req.body.user || req.body.email)) || req.query.user || '')).trim().toLowerCase();
+        if (who && FUNDRAISE_ADMINS.indexOf(who) >= 0) return next();
+        return res.status(403).json({
+            error: 'not_an_admin',
+            error_description: who
+                ? 'This account cannot see every campaign on the server.'
+                : 'Sign in to see every campaign on the server.',
+        });
+    });
 app.use(['/stripe/donation-report', '/api/stripe/donation-report'],
     (req: any, res: any, next: any) => {
         const who = ('' + ((req.body && (req.body.user || req.body.email)) || req.query.user || '')).trim();
@@ -3976,6 +3992,116 @@ app.use(['/stripe/donation-report', '/api/stripe/donation-report'],
             error_description: 'That campaign belongs to another account.',
         });
     });
+
+// EVERY CAMPAIGN ON THE SERVER, for the superadmin page (fundraise/super.js).
+//
+// One folder per account under the user-data root, named with the AES encoding of the
+// address, so the address is recovered by decoding the folder name rather than by keeping
+// a list anywhere. A folder that will not decode is reported as it is rather than skipped:
+// it is still holding campaigns, and a page that quietly drops accounts is worse than one
+// that shows an unreadable name.
+app.post(['/fundraise/all-campaigns', '/api/fundraise/all-campaigns'], (req: any, res: any) => {
+    try {
+        if (!fs.existsSync(userData)) return res.json({ ok: true, users: [] });
+        const users: any[] = [];
+        let campaigns = 0;
+        for (const enc of fs.readdirSync(userData)) {
+            const dir = path.join(userData, enc, 'public');
+            let st: any = null;
+            try { st = fs.statSync(path.join(userData, enc)); } catch (e) { st = null; }
+            if (!st || !st.isDirectory()) continue;
+            if (!fs.existsSync(dir)) continue;
+            let who = '';
+            try { who = decodeEmail(enc) || ''; } catch (e) { who = ''; }
+            const out: any[] = [];
+            for (const name of fs.readdirSync(dir)) {
+                if (!/\.fund$/i.test(name)) continue;
+                const full = path.join(dir, name);
+                let d: any = null, fst: any = null;
+                try { fst = fs.statSync(full); d = JSON.parse(fs.readFileSync(full, 'utf-8')); } catch (e) { d = null; }
+                if (!d || typeof d !== 'object') continue;
+                const gifts = Array.isArray(d.gifts) ? d.gifts : [];
+                out.push({
+                    file: name,
+                    path: '/' + enc + '/public/' + name,
+                    title: d.title || name.replace(/\.fund$/i, ''),
+                    subtitle: d.subtitle || '',
+                    currency: d.currency || 'USD',
+                    goal: +d.goal || 0,
+                    raised: +d.raised || 0,
+                    donors: +d.donors || 0,
+                    gifts: gifts.length,
+                    donateOn: !!(d.donate && d.donate.on),
+                    bytes: fst ? fst.size : 0,
+                    updated: d.updated || (fst ? new Date(fst.mtimeMs).toISOString() : ''),
+                });
+            }
+            if (!out.length) continue;
+            out.sort((a, b) => ('' + b.updated).localeCompare('' + a.updated));
+            campaigns += out.length;
+            users.push({ user: who, enc: enc, readable: !!who, campaigns: out });
+        }
+        users.sort((a, b) => ('' + (a.user || a.enc)).localeCompare('' + (b.user || b.enc)));
+        return res.json({ ok: true, users: users, accounts: users.length, campaigns: campaigns });
+    } catch (e: any) {
+        return res.status(500).json({ error: 'list_failed', error_description: e?.message || String(e) });
+    }
+});
+
+// WRITING INTO SOMEBODY ELSE'S FOLDER, which only an admin can reach (the middleware above).
+//
+// Deliberately NOT done by claiming the owner's address at /save-user-data. That endpoint
+// believes whoever a request says it is, so building the superadmin on top of it would have
+// meant teaching the console to claim an address -- a capability worth nobody having. This
+// route is the one place a cross-account write happens, it is behind the admin list, and it
+// can only touch a campaign document and its two sidecars inside one account's public
+// folder.
+app.post(['/fundraise/all-file', '/api/fundraise/all-file'], (req: any, res: any) => {
+    try {
+        const enc = ('' + ((req.body && req.body.enc) || '')).trim();
+        const name = ('' + ((req.body && req.body.name) || '')).trim();
+        const del = !!(req.body && req.body.remove);
+        // A folder name, not a path: the encoding is hex in production, but the rule that
+        // matters is that there is no separator and no dot in it. The resolve check below
+        // is what actually keeps the write inside the folder.
+        if (!/^[A-Za-z0-9_-]+$/.test(enc)) return res.status(400).json({ error: 'bad_account' });
+        if (!/^[A-Za-z0-9._-]+\.(fund|fundimg|fundteam)$/.test(name) || name.indexOf('..') >= 0)
+            return res.status(400).json({ error: 'bad_name' });
+        const dir = path.join(userData, enc, 'public');
+        const full = path.join(dir, name);
+        // Belt and braces over the name test above: whatever the string was, the file it
+        // resolves to has to be directly inside that account's own public folder.
+        if (path.dirname(path.resolve(full)) !== path.resolve(dir))
+            return res.status(400).json({ error: 'bad_name' });
+        if (del) {
+            let gone = 0;
+            const base = name.replace(/\.fund$/i, '');
+            // The picture and the team faces go with the campaign. Nothing else points at
+            // them once it is gone, and left behind they are orphans nobody will ever find.
+            const also = /\.fund$/i.test(name) ? [name, base + '.fundimg', base + '.fundteam'] : [name];
+            for (const f of also) {
+                const fp = path.join(dir, f);
+                try { if (fs.existsSync(fp)) { fs.unlinkSync(fp); gone++; } } catch (e) { }
+            }
+            return res.json({ ok: true, removed: gone });
+        }
+        const value = ('' + ((req.body && req.body.value) || ''));
+        if (!value) return res.status(400).json({ error: 'no_value' });
+        if (/\.fund$/i.test(name)) {
+            try { JSON.parse(value); } catch (e) { return res.status(400).json({ error: 'not_json' }); }
+        }
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(full, value);
+        // The marker that makes the folder readable without signing in. A campaign written
+        // into a folder that has never published one would otherwise be invisible to the
+        // display it exists for.
+        const share = path.join(dir, '.share');
+        try { if (!fs.existsSync(share)) fs.writeFileSync(share, 'public\n/public'); } catch (e) { }
+        return res.json({ ok: true, path: '/' + enc + '/public/' + name, bytes: value.length });
+    } catch (e: any) {
+        return res.status(500).json({ error: 'write_failed', error_description: e?.message || String(e) });
+    }
+});
 
 // EVERY CAMPAIGN A USER HAS, for the administration page (fundraise/admin.js). The folder
 // name under the user-data root is an AES encoding of the address, which the browser cannot
