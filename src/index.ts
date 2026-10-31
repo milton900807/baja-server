@@ -4078,12 +4078,18 @@ app.get(['/campaigns', '/campaigns/'], (req: any, res: any) => {
     };
     const desc = list.length
         ? (list.length + (list.length === 1 ? ' campaign' : ' campaigns') + ' raising money for rare disease, '
-            + money(total) + ' raised so far. No charge to run one, and no share of what you raise.')
-        : 'Campaigns raising money for rare disease. No charge to run one, and no share of what you raise.';
+            + money(total) + ' raised so far. No charge to run one, and we do not take a share of what you raise.')
+        : 'Campaigns raising money for rare disease. No charge to run one, and we do not take a share of what you raise.';
 
     // The tiles are rendered here AND rebuilt by the script below from /campaigns.json, so
     // the page is complete before any JavaScript runs -- a crawler, a reader with scripting
     // off and a slow phone all get the list -- and then keeps itself current.
+    const meta = (c: any, pct: number) => {
+        const bits: string[] = [];
+        if (+c.donors > 0) bits.push(c.donors + (c.donors === 1 ? ' donor' : ' donors'));
+        if (+c.goal > 0) bits.push(pct + '%');
+        return bits.length ? '<span class="meta">' + bits.join(' · ') + '</span>' : '';
+    };
     const card = (c: any) => {
         const pct = c.goal > 0 ? Math.max(0, Math.min(100, Math.round((c.raised / c.goal) * 100))) : 0;
         return '<a class="tile" href="/f/' + e(c.code) + '">'
@@ -4094,8 +4100,11 @@ app.get(['/campaigns', '/campaigns/'], (req: any, res: any) => {
             + '<span class="nums"><b>' + e(money(c.raised, c.currency)) + '</b>'
             + (c.goal > 0 ? '<i>of ' + e(money(c.goal, c.currency)) + '</i>' : '<i>raised</i>') + '</span>'
             + (c.goal > 0 ? '<span class="bar"><span style="width:' + pct + '%"></span></span>' : '')
-            + '<span class="meta">' + (c.donors > 0 ? (c.donors + (c.donors === 1 ? ' donor' : ' donors')) : 'Be the first to give')
-            + (c.goal > 0 ? ' · ' + pct + '%' : '') + '</span>'
+            // Nothing where the donor count would be, when there is nothing to say. A
+            // campaign with no gifts yet said "Be the first to give", which is a line of
+            // sales copy sitting under somebody's child's name, and it announced to every
+            // visitor which campaigns nobody has given to.
+            + meta(c, pct)
             + '</span></a>';
     };
     const empty = '<div class="empty"><div class="eh">No campaigns yet</div>'
@@ -4177,7 +4186,7 @@ app.get(['/campaigns', '/campaigns/'], (req: any, res: any) => {
             + '<option value="progress">Closest to goal</option>'
             + '<option value="title">By name</option></select></div>' : '')
         + '<div class="grid" id="grid">' + (list.length ? list.map(card).join('') : empty) + '</div>'
-        + '<footer>No charge to run a campaign, and no share of what you raise. '
+        + '<footer>No charge to run a campaign, and we do not take a share of what you raise. '
         + '<a href="/login">Start one</a>.</footer>'
         + '</div><script>'
         // The tiles are already on the page. This re-sorts and filters them without asking
@@ -4193,7 +4202,9 @@ app.get(['/campaigns', '/campaigns/'], (req: any, res: any) => {
         + '+(c.blurb?\'<span class="b">\'+esc(c.blurb)+\'</span>\':"")'
         + '+\'<span class="nums"><b>\'+esc(money(c.raised,c.currency))+\'</b>\'+(c.goal>0?\'<i>of \'+esc(money(c.goal,c.currency))+\'</i>\':\'<i>raised</i>\')+\'</span>\''
         + '+(c.goal>0?\'<span class="bar"><span style="width:\'+p+\'%"></span></span>\':"")'
-        + '+\'<span class="meta">\'+(c.donors>0?(c.donors+(c.donors===1?" donor":" donors")):"Be the first to give")+(c.goal>0?" · "+p+"%":"")+\'</span></span></a>\'}'
+        + '+meta(c,p)+\'</span></a>\'}'
+        + 'function meta(c,p){var b=[];if(c.donors>0)b.push(c.donors+(c.donors===1?" donor":" donors"));'
+        + 'if(c.goal>0)b.push(p+"%");return b.length?\'<span class="meta">\'+b.join(" · ")+"</span>":""}'
         + 'function draw(){var q=(document.getElementById("q")||{}).value||"";q=q.trim().toLowerCase();'
         + 'var s=(document.getElementById("sort")||{}).value||"updated";'
         + 'var l=DATA.filter(function(c){return !q||((c.title+" "+(c.blurb||"")).toLowerCase().indexOf(q)>=0)});'
