@@ -3730,7 +3730,7 @@ app.post(['/stripe/donation-sync', '/api/stripe/donation-sync'], async (req: any
         if (!added) return res.json({ ok: true, added: 0 });
         if (gifts.length > 200) gifts.length = 200;
         doc.updated = new Date().toISOString();
-        fs.writeFileSync(target, JSON.stringify(doc));
+        writeFileAtomic(target, JSON.stringify(doc));
         return res.json({ ok: true, added: added, amount: addedTotal, raised: doc.raised, donors: doc.donors });
     } catch (e: any) {
         return res.status(500).json({ error: 'stripe_error', error_description: e?.message || String(e) });
@@ -3764,6 +3764,21 @@ app.post(['/stripe/donation-sync', '/api/stripe/donation-sync'], async (req: any
 // while working perfectly from source. Anything more than one block needs belongs here.
 const FUNDRAISE_ADMINS = ('' + (process.env.FUNDRAISE_ADMINS || 'jeffmilto@gmail.com'))
     .split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
+
+// Write a file so that nobody can read it half-written: into a temporary name in the same
+// directory, then renamed over the target, which the filesystem does atomically. Anything
+// a display polls while people are watching it should be written this way. Falls back to a
+// plain write if the rename is refused, because a file written is better than none.
+function writeFileAtomic(target: string, value: string | Buffer) {
+    const tmp = target + '.wtmp-' + process.pid + '-' + Date.now();
+    try {
+        fs.writeFileSync(tmp, value);
+        fs.renameSync(tmp, target);
+    } catch (e) {
+        try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (e2) { }
+        fs.writeFileSync(target, value);
+    }
+}
 
 let __donationStripe: any = null;
 function stripeDonations(): any {
@@ -4375,7 +4390,7 @@ app.post(['/fundraise/all-file', '/api/fundraise/all-file'], (req: any, res: any
             try { JSON.parse(value); } catch (e) { return res.status(400).json({ error: 'not_json' }); }
         }
         fs.mkdirSync(dir, { recursive: true });
-        fs.writeFileSync(full, value);
+        writeFileAtomic(full, value);
         // The marker that makes the folder readable without signing in. A campaign written
         // into a folder that has never published one would otherwise be invisible to the
         // display it exists for.
@@ -4795,7 +4810,7 @@ app.post(['/fundraise/edit-file', '/api/fundraise/edit-file'], (req: any, res: a
             try { JSON.parse(value); } catch (e) { return res.status(400).json({ error: 'not_json' }); }
         }
         fs.mkdirSync(dir, { recursive: true });
-        fs.writeFileSync(full, value);
+        writeFileAtomic(full, value);
         try {
             const share = path.join(dir, '.share');
             if (!fs.existsSync(share)) fs.writeFileSync(share, 'public\n/public');
@@ -10189,7 +10204,12 @@ app.post('/save-user-data', async (req, res) => {
         vcdir = vcdir.replace(`${user}/${user}`, user)
         mkDirByPathSync(vcdir);
         { const refused = refuseEmptyOverwrite(vc, '' + req.body.value, req.body.allowEmpty); if (refused) return res.status(409).json({ error: refused, msg: refused, refused: 'empty-overwrite' }); }
-        fs.writeFileSync(vc, '' + req.body.value);
+        // WRITTEN BESIDE, THEN MOVED INTO PLACE. A fundraising display re-reads its campaign
+        // every ten seconds from several screens at once, and a plain write is not atomic:
+        // a read landing in the middle of one gets half a file, which parses as nothing, and
+        // the display went blank in front of a room. A rename within the same directory is
+        // atomic, so a reader sees either the old file or the new one.
+        writeFileAtomic(vc, '' + req.body.value);
 
 
 
