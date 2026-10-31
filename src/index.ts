@@ -3950,7 +3950,10 @@ const FUNDRAISE_ADMINS = ('' + (process.env.FUNDRAISE_ADMINS || 'jeffmilto@gmail
 // by design -- every campaign on the box, and writing into somebody else's folder -- so
 // they are admins only, with no owner path to fall back on.
 app.use(['/fundraise/all-campaigns', '/api/fundraise/all-campaigns',
-         '/fundraise/all-file', '/api/fundraise/all-file'],
+         '/fundraise/all-file', '/api/fundraise/all-file',
+         '/fundraise/deleted', '/api/fundraise/deleted',
+         '/fundraise/restore', '/api/fundraise/restore',
+         '/fundraise/purge', '/api/fundraise/purge'],
     (req: any, res: any, next: any) => {
         const who = ('' + ((req.body && (req.body.user || req.body.email)) || req.query.user || '')).trim().toLowerCase();
         if (who && FUNDRAISE_ADMINS.indexOf(who) >= 0) return next();
@@ -4010,6 +4013,11 @@ app.use(['/stripe/donation-report', '/api/stripe/donation-report'],
 // awareness ribbon as its fallback, and is already cached.
 const CAMPAIGNS_TTL = 30 * 1000;
 let __campaignsCache: { at: number; list: any[] } = { at: 0, list: [] };
+// Published through the global rather than called directly, because the installer that
+// patches a built server inserts each block of this file inside its own function, where
+// one block cannot see another's variables. Anything that changes what is published says
+// so this way: here it is the same module, there it is the one thing they share.
+(global as any).__bajaDropCampaignCache = () => { __campaignsCache = { at: 0, list: [] }; };
 
 function campaignIndex(): any[] {
     const now = Date.now();
@@ -4338,6 +4346,226 @@ app.post(['/fundraise/all-file', '/api/fundraise/all-file'], (req: any, res: any
         return res.json({ ok: true, path: '/' + enc + '/public/' + name, bytes: value.length });
     } catch (e: any) {
         return res.status(500).json({ error: 'write_failed', error_description: e?.message || String(e) });
+    }
+});
+
+// ---- A DELETED CAMPAIGN IS NOT GONE ------------------------------------------------
+//
+// Deleting used to mean /rm: the document unlinked, the picture and the team file left
+// behind as orphans, and nothing to go back to. A campaign is somebody's fundraiser for a
+// sick child, often with the only copy of its story in it, and "are you sure" pressed
+// twice at eleven at night is not a backup.
+//
+// So a delete RETIRES the campaign: the document and its two sidecars are moved, not
+// unlinked, into <account>/deleted-campaigns/<stamp>__<name>. Out of the public folder, so
+// nobody can read it and the directory cannot list it; still on the account, so an admin
+// can put it back.
+//
+// THE SHARE ALIAS IS LEFT ALONE on purpose. It maps a code to the public path, which is
+// now empty, so /f/<code> stops working the moment the campaign is retired. Restore puts
+// the file back at exactly that path, and every link anyone was given starts working
+// again. Deleting the alias would make the restore silently incomplete.
+//
+// Retiring is open to the campaign's OWNER as well as to an admin, because it is what the
+// delete button in their own console does. Listing, restoring and purging are admins only
+// (the middleware above), because they cross accounts.
+const RETIRED_DIR = 'deleted-campaigns';
+const RETIRE_NAME = /^(\d{8}T\d{6}Z)__([A-Za-z0-9._-]+\.fund)$/;
+const campaignFiles = (name: string) => {
+    const base = name.replace(/\.fund$/i, '');
+    return [name, base + '.fundimg', base + '.fundteam'];
+};
+// A campaign path, picked apart and checked: one document directly inside one account's
+// own public folder, nothing that climbs out of it.
+const splitCampaignPath = (rel: string) => {
+    const m = /^\/([A-Za-z0-9_-]+)\/public\/([A-Za-z0-9._-]+\.fund)$/.exec(('' + rel).replace(/\/{2,}/g, '/'));
+    if (!m || m[2].indexOf('..') >= 0) return null;
+    return { enc: m[1], name: m[2] };
+};
+const retiredDirOf = (enc: string) => path.join(userData, enc, RETIRED_DIR);
+// A campaign that has just appeared or disappeared should not wait out the directory's
+// half-minute cache. See the note where that function is published.
+const dropCampaignCache = () => {
+    try { const f = (global as any).__bajaDropCampaignCache; if (typeof f === 'function') f(); } catch (e) { }
+};
+// Belt and braces over every name test: whatever the string was, the file it resolves to
+// has to sit directly inside the folder we meant.
+const insideDir = (dir: string, full: string) => path.dirname(path.resolve(full)) === path.resolve(dir);
+
+app.post(['/fundraise/retire', '/api/fundraise/retire'], (req: any, res: any) => {
+    try {
+        const who = ('' + ((req.body && (req.body.user || req.body.email)) || '')).trim();
+        if (!who) return res.status(403).json({ error: 'not_signed_in', error_description: 'Sign in first.' });
+        const hit = splitCampaignPath('' + ((req.body && req.body.path) || ''));
+        if (!hit) return res.status(400).json({ error: 'bad_path' });
+        const admin = FUNDRAISE_ADMINS.indexOf(who.toLowerCase()) >= 0;
+        // Case-SENSITIVE on the folder: the encoding is ciphertext, where two accounts can
+        // differ by nothing but the case of a letter.
+        const mine = (() => { try { return ('' + (encodeEmail(who) || '')) === hit.enc; } catch (e) { return false; } })();
+        if (!admin && !mine) return res.status(403).json({ error: 'not_your_campaign', error_description: 'That campaign belongs to another account.' });
+
+        const pub = path.join(userData, hit.enc, 'public');
+        const src = path.join(pub, hit.name);
+        if (!insideDir(pub, src)) return res.status(400).json({ error: 'bad_path' });
+        if (!fs.existsSync(src)) return res.status(404).json({ error: 'not_found', error_description: 'There is no campaign at that path.' });
+
+        const dir = retiredDirOf(hit.enc);
+        fs.mkdirSync(dir, { recursive: true });
+        const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
+        const moved: string[] = [];
+        for (const f of campaignFiles(hit.name)) {
+            const from = path.join(pub, f);
+            const to = path.join(dir, stamp + '__' + f);
+            if (!fs.existsSync(from) || !insideDir(pub, from) || !insideDir(dir, to)) continue;
+            try { fs.renameSync(from, to); moved.push(f); }
+            catch (e) { try { fs.copyFileSync(from, to); fs.unlinkSync(from); moved.push(f); } catch (e2) { } }
+        }
+        if (moved.indexOf(hit.name) < 0) return res.status(500).json({ error: 'retire_failed', error_description: 'The campaign could not be moved.' });
+
+        // Who did this and what it was called, written into the archived copy so a restore
+        // months later does not depend on reading a timestamp out of a file name.
+        const arch = path.join(dir, stamp + '__' + hit.name);
+        try {
+            const d = JSON.parse(fs.readFileSync(arch, 'utf-8'));
+            d.deletedAt = new Date().toISOString();
+            d.deletedBy = who;
+            d.deletedFrom = hit.name;
+            fs.writeFileSync(arch, JSON.stringify(d));
+        } catch (e) { /* an unparseable document is still worth keeping */ }
+        dropCampaignCache();
+        return res.json({ ok: true, retired: stamp + '__' + hit.name, files: moved.length, enc: hit.enc });
+    } catch (e: any) {
+        return res.status(500).json({ error: 'retire_failed', error_description: e?.message || String(e) });
+    }
+});
+
+// Every retired campaign on the box, for the superadmin page.
+app.post(['/fundraise/deleted', '/api/fundraise/deleted'], (req: any, res: any) => {
+    try {
+        if (!fs.existsSync(userData)) return res.json({ ok: true, users: [] });
+        const only = ('' + ((req.body && req.body.enc) || '')).trim();
+        const users: any[] = [];
+        let total = 0;
+        for (const enc of fs.readdirSync(userData)) {
+            if (only && enc !== only) continue;
+            const dir = retiredDirOf(enc);
+            if (!fs.existsSync(dir)) continue;
+            let who = '';
+            try { who = decodeEmail(enc) || ''; } catch (e) { who = ''; }
+            const out: any[] = [];
+            for (const name of fs.readdirSync(dir)) {
+                const m = RETIRE_NAME.exec(name);
+                if (!m) continue;
+                const full = path.join(dir, name);
+                let d: any = null, fst: any = null;
+                try { fst = fs.statSync(full); d = JSON.parse(fs.readFileSync(full, 'utf-8')); } catch (e) { d = null; }
+                const was = (d && d.deletedFrom) || m[2];
+                out.push({
+                    file: name,
+                    restoreTo: was,
+                    taken: fs.existsSync(path.join(userData, enc, 'public', was)),
+                    title: (d && d.title) || was.replace(/\.fund$/i, ''),
+                    subtitle: (d && d.subtitle) || '',
+                    currency: (d && d.currency) || 'USD',
+                    goal: (d && +d.goal) || 0,
+                    raised: (d && +d.raised) || 0,
+                    donors: (d && +d.donors) || 0,
+                    readable: !!d,
+                    deletedAt: (d && d.deletedAt) || (fst ? new Date(fst.mtimeMs).toISOString() : ''),
+                    deletedBy: (d && d.deletedBy) || '',
+                    bytes: fst ? fst.size : 0,
+                });
+            }
+            if (!out.length) continue;
+            out.sort((a, b) => ('' + b.deletedAt).localeCompare('' + a.deletedAt));
+            total += out.length;
+            users.push({ user: who, enc: enc, readable: !!who, deleted: out });
+        }
+        users.sort((a, b) => ('' + (a.user || a.enc)).localeCompare('' + (b.user || b.enc)));
+        return res.json({ ok: true, users: users, accounts: users.length, deleted: total });
+    } catch (e: any) {
+        return res.status(500).json({ error: 'list_failed', error_description: e?.message || String(e) });
+    }
+});
+
+// Put one back. The campaign returns to the path it was published at, so the links people
+// were given work again.
+app.post(['/fundraise/restore', '/api/fundraise/restore'], (req: any, res: any) => {
+    try {
+        const enc = ('' + ((req.body && req.body.enc) || '')).trim();
+        const name = ('' + ((req.body && req.body.name) || '')).trim();
+        if (!/^[A-Za-z0-9_-]+$/.test(enc)) return res.status(400).json({ error: 'bad_account' });
+        const m = RETIRE_NAME.exec(name);
+        if (!m || name.indexOf('..') >= 0) return res.status(400).json({ error: 'bad_name' });
+        const stamp = m[1];
+        const dir = retiredDirOf(enc);
+        const arch = path.join(dir, name);
+        if (!insideDir(dir, arch) || !fs.existsSync(arch)) return res.status(404).json({ error: 'not_found' });
+
+        let was = m[2];
+        let doc: any = null;
+        try { doc = JSON.parse(fs.readFileSync(arch, 'utf-8')); } catch (e) { doc = null; }
+        if (doc && typeof doc.deletedFrom === 'string' && /^[A-Za-z0-9._-]+\.fund$/.test(doc.deletedFrom)) was = doc.deletedFrom;
+
+        const pub = path.join(userData, enc, 'public');
+        const target = path.join(pub, was);
+        if (!insideDir(pub, target)) return res.status(400).json({ error: 'bad_name' });
+        // A campaign published since under the same name is a different campaign with the
+        // same link. Overwriting it silently would lose it exactly the way this endpoint
+        // exists to prevent.
+        if (fs.existsSync(target) && !(req.body && req.body.overwrite === true)) {
+            return res.status(409).json({
+                error: 'name_taken',
+                error_description: 'A campaign called ' + was + ' is published on that account already. '
+                    + 'Rename or delete that one first, or restore over it on purpose.',
+            });
+        }
+        fs.mkdirSync(pub, { recursive: true });
+        const back: string[] = [];
+        for (const f of campaignFiles(was)) {
+            const from = path.join(dir, stamp + '__' + f);
+            const to = path.join(pub, f);
+            if (!fs.existsSync(from) || !insideDir(dir, from) || !insideDir(pub, to)) continue;
+            try { fs.renameSync(from, to); back.push(f); }
+            catch (e) { try { fs.copyFileSync(from, to); fs.unlinkSync(from); back.push(f); } catch (e2) { } }
+        }
+        if (back.indexOf(was) < 0) return res.status(500).json({ error: 'restore_failed', error_description: 'The campaign could not be moved back.' });
+        if (doc) {
+            delete doc.deletedAt; delete doc.deletedBy; delete doc.deletedFrom;
+            try { fs.writeFileSync(target, JSON.stringify(doc)); } catch (e) { }
+        }
+        // The marker that makes the folder readable without signing in, in case this is the
+        // only campaign the account has.
+        try {
+            const share = path.join(pub, '.share');
+            if (!fs.existsSync(share)) fs.writeFileSync(share, 'public\n/public');
+        } catch (e) { }
+        dropCampaignCache();
+        return res.json({ ok: true, path: '/' + enc + '/public/' + was, file: was, files: back.length });
+    } catch (e: any) {
+        return res.status(500).json({ error: 'restore_failed', error_description: e?.message || String(e) });
+    }
+});
+
+// And the one irreversible button, which only an admin has.
+app.post(['/fundraise/purge', '/api/fundraise/purge'], (req: any, res: any) => {
+    try {
+        const enc = ('' + ((req.body && req.body.enc) || '')).trim();
+        const name = ('' + ((req.body && req.body.name) || '')).trim();
+        if (!/^[A-Za-z0-9_-]+$/.test(enc)) return res.status(400).json({ error: 'bad_account' });
+        const m = RETIRE_NAME.exec(name);
+        if (!m || name.indexOf('..') >= 0) return res.status(400).json({ error: 'bad_name' });
+        const dir = retiredDirOf(enc);
+        let gone = 0;
+        for (const f of campaignFiles(m[2])) {
+            const fp = path.join(dir, m[1] + '__' + f);
+            if (!insideDir(dir, fp)) continue;
+            try { if (fs.existsSync(fp)) { fs.unlinkSync(fp); gone++; } } catch (e) { }
+        }
+        if (!gone) return res.status(404).json({ error: 'not_found' });
+        return res.json({ ok: true, removed: gone });
+    } catch (e: any) {
+        return res.status(500).json({ error: 'purge_failed', error_description: e?.message || String(e) });
     }
 });
 
