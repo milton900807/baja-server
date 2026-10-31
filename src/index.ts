@@ -4848,6 +4848,147 @@ app.post(['/fundraise/read-file', '/api/fundraise/read-file'], (req: any, res: a
     }
 });
 
+// ---- A TIMELINE, DRAFTED ----------------------------------------------------------
+//
+// "What will you do with the money, and when" is the question every donor has and the
+// hardest part of the page to start writing. This asks Claude for a first draft from what
+// the organiser has already typed: the campaign's name, what it is for, the goal.
+//
+// IT IS A DRAFT AND NOTHING ELSE. Nothing here is published, nothing is written to the
+// campaign, and the console puts the result in editable fields for the organiser to
+// correct, cut and rewrite. A plan for spending somebody's donations is theirs to stand
+// behind, and a model that has never met the project is not the author of it.
+//
+// WHAT IT IS TOLD NOT TO DO matters as much as the rest: no promises of a cure, no
+// timelines for approval it cannot know, no clinical claims. The directory says every
+// campaign is reviewed for scientific merit, and a drafting tool that writes the very
+// thing that gets a campaign removed would be worse than no tool.
+//
+// It costs money per call, so: signed in, one call at a time per account, a few seconds
+// between them, and a daily ceiling. The limits are per account rather than per campaign
+// because the cost follows the caller.
+const TIMELINE_MODEL = ('' + (process.env.ANTHROPIC_MODEL || 'claude-haiku-5-5')).trim();
+const TIMELINE_GAP = 6 * 1000;
+const TIMELINE_A_DAY = 60;
+const __timelineLast: { [who: string]: number } = {};
+const __timelineCount: { [who: string]: { day: string; n: number } } = {};
+
+const timelinePrompt = (c: any) => {
+    const bits: string[] = [];
+    if (c.title) bits.push('Campaign: ' + c.title);
+    if (c.subtitle) bits.push('One line under it: ' + c.subtitle);
+    if (+c.goal > 0) bits.push('Goal: ' + (c.currency || 'USD') + ' ' + (+c.goal).toLocaleString('en-US'));
+    if (+c.raised > 0) bits.push('Raised so far: ' + (c.currency || 'USD') + ' ' + (+c.raised).toLocaleString('en-US'));
+    if (c.story) bits.push('What the organiser has written about it:\n' + ('' + c.story).slice(0, 4000));
+    if (c.note) bits.push('A line shown on the display: ' + ('' + c.note).slice(0, 400));
+    if (c.brief) bits.push('What the organiser asked for in this timeline: ' + ('' + c.brief).slice(0, 600));
+    return bits.join('\n\n');
+};
+
+const TIMELINE_SYSTEM = [
+    'You are drafting the "what happens next" timeline for a rare-disease research fundraising',
+    'campaign, for the organiser to edit before anyone sees it.',
+    '',
+    'Answer with JSON and nothing else: an array of 3 to 6 objects, each',
+    '{"when": string, "title": string, "text": string}.',
+    '  when   a stage or a rough period in the organiser\'s own terms, such as "First 3 months",',
+    '         "Once funded" or "Year 2". Never a calendar date you have invented.',
+    '  title  five words or fewer.',
+    '  text   one or two plain sentences, 40 words at most, saying what is done and what it buys.',
+    '',
+    'Rules, and they matter more than the prose:',
+    '  * Never promise or imply a cure, a treatment that will work, a clinical benefit, or that',
+    '    anyone will be helped. Say what will be ATTEMPTED and what would be learned.',
+    '  * Never give regulatory or approval dates, trial start dates, or any date you cannot know.',
+    '  * No medical advice and no claims about safety or efficacy.',
+    '  * Only what follows from the material given. Invent no collaborators, institutions,',
+    '    animal models, assays or figures that are not in it. If the material is thin, keep the',
+    '    stages general rather than filling them with specifics.',
+    '  * Plain words. No marketing, no exclamation marks, no "revolutionary", "breakthrough",',
+    '    "groundbreaking", "hope" as a noun.',
+    '  * Write it as the organiser would: "we", not "the campaign".',
+].join('\n');
+
+app.post(['/fundraise/timeline', '/api/fundraise/timeline'], async (req: any, res: any) => {
+    try {
+        const who = normEmail(req.body && (req.body.user || req.body.email));
+        if (!who) return res.status(403).json({ error: 'not_signed_in', error_description: 'Sign in first.' });
+        const key = ('' + (process.env.ANTHROPIC_API_KEY || '')).trim();
+        if (!key) {
+            return res.status(503).json({
+                error: 'no_ai_key',
+                error_description: 'This server has no ANTHROPIC_API_KEY set, so it cannot draft anything.',
+            });
+        }
+        // Checked BEFORE the rate limit is touched: a request that was never going to ask
+        // the model anything should not spend somebody's next few seconds.
+        const c = (req.body && typeof req.body.campaign === 'object') ? req.body.campaign : {};
+        if (!('' + (c.title || '')).trim() && !('' + (c.story || '')).trim()) {
+            return res.status(400).json({
+                error: 'nothing_to_go_on',
+                error_description: 'Give the campaign a name, or write something about it, and try again.',
+            });
+        }
+        const now = Date.now();
+        if (now - (__timelineLast[who] || 0) < TIMELINE_GAP) {
+            return res.status(429).json({ error: 'too_soon', error_description: 'One draft at a time. Try again in a few seconds.' });
+        }
+        const day = new Date().toISOString().slice(0, 10);
+        const seen = __timelineCount[who];
+        const count = (seen && seen.day === day) ? seen.n : 0;
+        if (count >= TIMELINE_A_DAY) {
+            return res.status(429).json({ error: 'enough_for_today', error_description: 'That is as many drafts as this account gets in a day.' });
+        }
+        __timelineLast[who] = now;
+        __timelineCount[who] = { day: day, n: count + 1 };
+
+        const said = timelinePrompt(c);
+
+        const r = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                'x-api-key': key,
+                'anthropic-version': '2023-06-01',
+            },
+            body: JSON.stringify({
+                model: TIMELINE_MODEL,
+                max_tokens: 1200,
+                system: TIMELINE_SYSTEM,
+                messages: [{ role: 'user', content: said }],
+            }),
+        });
+        const body: any = await r.json().catch(() => null);
+        if (!r.ok) {
+            // Passed through rather than flattened: "model not found" and "credit balance
+            // too low" need different things done about them, and only the message says which.
+            const why = (body && body.error && (body.error.message || body.error.type)) || ('the API answered ' + r.status);
+            return res.status(502).json({ error: 'ai_failed', error_description: '' + why, model: TIMELINE_MODEL });
+        }
+        const text = (Array.isArray(body && body.content) ? body.content : [])
+            .filter((b: any) => b && b.type === 'text').map((b: any) => b.text).join('\n').trim();
+        // The array, wherever in the reply it is. Asking for JSON and nothing else works
+        // nearly always, and "nearly" is not a thing to build on.
+        let rows: any = null;
+        try { rows = JSON.parse(text); } catch (e) {
+            const a = text.indexOf('['), b2 = text.lastIndexOf(']');
+            if (a >= 0 && b2 > a) { try { rows = JSON.parse(text.slice(a, b2 + 1)); } catch (e2) { rows = null; } }
+        }
+        if (!Array.isArray(rows)) {
+            return res.status(502).json({ error: 'ai_unreadable', error_description: 'The draft did not come back as a timeline.' });
+        }
+        const clean = rows.slice(0, 8).map((x: any) => ({
+            when: ('' + ((x && x.when) || '')).replace(/\s+/g, ' ').trim().slice(0, 40),
+            title: ('' + ((x && x.title) || '')).replace(/\s+/g, ' ').trim().slice(0, 80),
+            text: ('' + ((x && x.text) || '')).replace(/[\r\n]+/g, ' ').trim().slice(0, 400),
+        })).filter((x: any) => x.title || x.text);
+        if (!clean.length) return res.status(502).json({ error: 'ai_empty', error_description: 'The draft came back empty.' });
+        return res.json({ ok: true, timeline: clean, model: TIMELINE_MODEL });
+    } catch (e: any) {
+        return res.status(500).json({ error: 'timeline_failed', error_description: e?.message || String(e) });
+    }
+});
+
 // EVERY CAMPAIGN A USER HAS, for the administration page (fundraise/admin.js). The folder
 // name under the user-data root is an AES encoding of the address, which the browser cannot
 // work out for itself, so the listing has to happen here.
