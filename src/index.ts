@@ -3754,6 +3754,17 @@ app.post(['/stripe/donation-sync', '/api/stripe/donation-sync'], async (req: any
 // A function declaration, not a const: these endpoints are inserted into the built file as
 // separate blocks whose order is not guaranteed, and a hoisted function is callable from any
 // of them whatever order they end up in.
+// WHO IS AN ADMIN. Declared HERE, in the one block the installer inserts at the TOP LEVEL
+// of a built server, rather than beside the middleware that reads it.
+//
+// install-donation-endpoint.py patches a compiled dist/index.js by inserting each block of
+// this file wrapped in its own function, so a const declared in one of them is invisible to
+// all the others. Beside the middleware this was fine until a second block needed it, and
+// then sharing a campaign answered "FUNDRAISE_ADMINS is not defined" on a patched server
+// while working perfectly from source. Anything more than one block needs belongs here.
+const FUNDRAISE_ADMINS = ('' + (process.env.FUNDRAISE_ADMINS || 'jeffmilto@gmail.com'))
+    .split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
+
 let __donationStripe: any = null;
 function stripeDonations(): any {
     const k = ('' + (process.env.STRIPE_DONATION_SECRET_KEY || process.env.STRIPE_SECRET_KEY || '')).trim();
@@ -3943,8 +3954,10 @@ app.get(['/stripe/payment-methods', '/api/stripe/payment-methods'], async (_req:
 //
 // It is registered as middleware ABOVE the route it protects, because Express runs handlers
 // in the order they were added.
-const FUNDRAISE_ADMINS = ('' + (process.env.FUNDRAISE_ADMINS || 'jeffmilto@gmail.com'))
-    .split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
+//
+// FUNDRAISE_ADMINS itself is declared further up, beside the Stripe helpers, for a reason
+// that has nothing to do with this middleware and everything to do with how this file is
+// deployed: see the note there.
 //
 // The two /fundraise/all-* routes below are a different matter again: they cross accounts
 // by design -- every campaign on the box, and writing into somebody else's folder -- so
