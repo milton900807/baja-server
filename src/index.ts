@@ -4176,7 +4176,7 @@ app.get(['/campaigns', '/campaigns/'], (req: any, res: any) => {
         // repeated above a grid of campaigns is a line of nothing. The sentence that
         // remains says something: how many there are and what they have raised.
         + '<header><div><p class="sub" id="sub">' + e(desc) + '</p></div>'
-        + '<span class="acts"><a class="plain" href="/login">Log in</a>'
+        + '<span class="acts" id="acts"><a class="plain" href="/login">Log in</a>'
         + '<a class="go" href="/login">Start a campaign</a></span></header>'
         + (list.length ? '<div class="tools">'
             + '<input id="q" type="search" placeholder="Search campaigns" aria-label="Search campaigns">'
@@ -4214,6 +4214,14 @@ app.get(['/campaigns', '/campaigns/'], (req: any, res: any) => {
         + 'return String(b.updated).localeCompare(String(a.updated))});'
         + 'var g=document.getElementById("grid");'
         + 'g.innerHTML=l.length?l.map(card).join(""):\'<div class="empty"><div class="eh">Nothing matches that</div><p>Try fewer words.</p></div>\';}'
+        // SOMEBODY ALREADY SIGNED IN DOES NOT NEED A LOG IN BUTTON. The session lives in
+        // localStorage under oidc.session, so this page can tell without asking the server
+        // and without a cookie. It changes the two buttons and nothing else: a signed-in
+        // visitor who came here to look at the directory is left looking at it.
+        + 'try{var ses=JSON.parse(localStorage.getItem("oidc.session")||"null");'
+        + 'if(ses&&(ses.user||ses.email||ses.id_token)){var A=document.getElementById("acts");'
+        + 'if(A)A.innerHTML=\'<a class="plain" href="/app/fundraise/admin">My campaigns</a>\''
+        + '+\'<a class="go" href="/app/baja/init">Open gene.clinic</a>\';}}catch(e){}'
         + 'var qi=document.getElementById("q"),si=document.getElementById("sort");'
         + 'if(qi)qi.addEventListener("input",draw);if(si)si.addEventListener("change",draw);'
         + 'setInterval(function(){fetch("/campaigns.json",{cache:"no-store"}).then(function(r){return r.json()}).then(function(j){'
