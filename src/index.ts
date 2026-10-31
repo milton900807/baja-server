@@ -4569,6 +4569,232 @@ app.post(['/fundraise/purge', '/api/fundraise/purge'], (req: any, res: any) => {
     }
 });
 
+// ---- WORKING ON A CAMPAIGN TOGETHER -------------------------------------------------
+//
+// A campaign is usually not one person's job: somebody keeps the total, somebody else
+// writes the updates, and until now only the account that first pressed Publish could do
+// either. Sharing is per campaign, granted by the account that owns it, and it grants one
+// thing: the right to edit that campaign through the console.
+//
+// WHERE THE LIST LIVES. In <account>/campaign-editors.json, NOT in the campaign document.
+// The document is fetched by anyone who opens the public display, so a list of colleagues'
+// email addresses in it would be a list of email addresses on the open web. This file is
+// outside the public folder and is only ever read by this server.
+//
+// WHAT IT IS AND IS NOT. An editor can change the campaign, its picture and its team. An
+// editor cannot delete it, cannot hand the campaign to anybody else, and cannot see the
+// donor report, which stays with the owner and the admins. Only the owner (and an admin)
+// changes the list.
+//
+// HOW STRONG IT IS. Exactly as strong as the rest of this server's idea of who you are,
+// which is the address the browser sends. That is a claim, not a proof, and the honest
+// description of this feature is that it decides what the console OFFERS somebody and
+// keeps a cross-account write inside one checked route, rather than that it withstands a
+// forged request. Verifying the OIDC id_token here is the change that would make it so,
+// and it is the same change the rest of these routes are waiting on.
+const EDITORS_FILE = 'campaign-editors.json';
+const editorsPath = (enc: string) => path.join(userData, enc, EDITORS_FILE);
+const readEditors = (enc: string): { [file: string]: any } => {
+    try {
+        const raw = fs.readFileSync(editorsPath(enc), 'utf-8');
+        const d = JSON.parse(raw);
+        return (d && typeof d === 'object') ? d : {};
+    } catch (e) { return {}; }
+};
+const writeEditors = (enc: string, map: any) => {
+    const dir = path.join(userData, enc);
+    fs.mkdirSync(dir, { recursive: true });
+    const tmp = editorsPath(enc) + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(map, null, 2));
+    fs.renameSync(tmp, editorsPath(enc));
+};
+const editorsOf = (enc: string, file: string): string[] => {
+    const e = readEditors(enc)[file];
+    const list = (e && Array.isArray(e.editors)) ? e.editors : [];
+    return list.map((x: any) => ('' + x).trim().toLowerCase()).filter(Boolean);
+};
+// Owner, admin, or named on the campaign's own list. The owner test is case-SENSITIVE on
+// the folder, because the encoding is ciphertext where two accounts can differ by nothing
+// but the case of a letter.
+const mayEditCampaign = (who: string, enc: string, file: string) => {
+    const w = ('' + who).trim();
+    if (!w) return false;
+    if (FUNDRAISE_ADMINS.indexOf(w.toLowerCase()) >= 0) return true;
+    try { if (('' + (encodeEmail(w) || '')) === enc) return true; } catch (e) { }
+    return editorsOf(enc, file).indexOf(w.toLowerCase()) >= 0;
+};
+const ownsAccount = (who: string, enc: string) => {
+    const w = ('' + who).trim();
+    if (!w) return false;
+    if (FUNDRAISE_ADMINS.indexOf(w.toLowerCase()) >= 0) return true;
+    try { return ('' + (encodeEmail(w) || '')) === enc; } catch (e) { return false; }
+};
+
+// Who may edit this campaign: read the list, add somebody, take somebody off.
+app.post(['/fundraise/share', '/api/fundraise/share'], (req: any, res: any) => {
+    try {
+        const who = ('' + ((req.body && (req.body.user || req.body.email)) || '')).trim();
+        if (!who) return res.status(403).json({ error: 'not_signed_in', error_description: 'Sign in first.' });
+        const hit = splitCampaignPath('' + ((req.body && req.body.path) || ''));
+        if (!hit) return res.status(400).json({ error: 'bad_path' });
+        if (!ownsAccount(who, hit.enc)) {
+            return res.status(403).json({
+                error: 'not_yours',
+                error_description: 'Only the account a campaign belongs to can change who may edit it.',
+            });
+        }
+        const map = readEditors(hit.enc);
+        const entry = (map[hit.name] && typeof map[hit.name] === 'object') ? map[hit.name] : { editors: [] };
+        let list = (Array.isArray(entry.editors) ? entry.editors : [])
+            .map((x: any) => ('' + x).trim().toLowerCase()).filter(Boolean);
+        const add = normEmail(req.body && req.body.add);
+        const drop = ('' + ((req.body && req.body.remove) || '')).trim().toLowerCase();
+        let changed = false;
+        if (req.body && req.body.add && !add) {
+            return res.status(400).json({ error: 'bad_email', error_description: 'That does not look like an email address.' });
+        }
+        if (add) {
+            // Granting the owner access to their own campaign is a no-op worth refusing
+            // out loud: it reads as "done" otherwise, and then the name sits in a list
+            // where it means nothing.
+            let ownSelf = false;
+            try { ownSelf = ('' + (encodeEmail(add) || '')) === hit.enc; } catch (e) { }
+            if (ownSelf) return res.status(400).json({ error: 'already_owner', error_description: 'That is the account the campaign belongs to.' });
+            if (list.length >= 25) return res.status(400).json({ error: 'too_many', error_description: 'A campaign can be shared with 25 people.' });
+            if (list.indexOf(add) < 0) { list.push(add); changed = true; }
+        }
+        if (drop && list.indexOf(drop) >= 0) { list = list.filter((x: string) => x !== drop); changed = true; }
+        if (changed) {
+            if (list.length) map[hit.name] = { editors: list, updated: new Date().toISOString(), by: who };
+            else delete map[hit.name];
+            writeEditors(hit.enc, map);
+        }
+        return res.json({ ok: true, editors: list, changed: changed });
+    } catch (e: any) {
+        return res.status(500).json({ error: 'share_failed', error_description: e?.message || String(e) });
+    }
+});
+
+// The campaigns other people have shared with this account. A walk of every account, so it
+// is cached for a few seconds: it is read on the way into two screens.
+const SHARED_TTL = 10 * 1000;
+let __sharedCache: { at: number; by: { [who: string]: any[] } } = { at: 0, by: {} };
+app.post(['/fundraise/shared-with-me', '/api/fundraise/shared-with-me'], (req: any, res: any) => {
+    try {
+        const who = normEmail(req.body && (req.body.user || req.body.email));
+        if (!who) return res.status(403).json({ error: 'not_signed_in', error_description: 'Sign in first.' });
+        const now = Date.now();
+        if (now - __sharedCache.at > SHARED_TTL) __sharedCache = { at: now, by: {} };
+        if (__sharedCache.by[who]) return res.json({ ok: true, campaigns: __sharedCache.by[who] });
+        const out: any[] = [];
+        if (fs.existsSync(userData)) {
+            for (const enc of fs.readdirSync(userData)) {
+                const map = readEditors(enc);
+                let owner = '';
+                for (const file of Object.keys(map)) {
+                    const list = editorsOf(enc, file);
+                    if (list.indexOf(who) < 0) continue;
+                    const full = path.join(userData, enc, 'public', file);
+                    let d: any = null, st: any = null;
+                    try { st = fs.statSync(full); d = JSON.parse(fs.readFileSync(full, 'utf-8')); } catch (e) { d = null; }
+                    if (!d) continue;      // deleted since it was shared
+                    if (!owner) { try { owner = decodeEmail(enc) || ''; } catch (e) { owner = ''; } }
+                    out.push({
+                        file: file,
+                        path: '/' + enc + '/public/' + file,
+                        enc: enc,
+                        owner: owner,
+                        title: d.title || file.replace(/\.fund$/i, ''),
+                        subtitle: d.subtitle || '',
+                        currency: d.currency || 'USD',
+                        goal: +d.goal || 0,
+                        raised: +d.raised || 0,
+                        donors: +d.donors || 0,
+                        donateOn: !!(d.donate && d.donate.on),
+                        updated: d.updated || (st ? new Date(st.mtimeMs).toISOString() : ''),
+                    });
+                }
+            }
+        }
+        out.sort((a, b) => ('' + b.updated).localeCompare('' + a.updated));
+        __sharedCache.by[who] = out;
+        return res.json({ ok: true, campaigns: out });
+    } catch (e: any) {
+        return res.status(500).json({ error: 'list_failed', error_description: e?.message || String(e) });
+    }
+});
+
+// Writing a campaign somebody shared with you. The same shape as /fundraise/all-file, and
+// deliberately a separate route: that one is for admins and takes an account to write
+// into, this one takes the campaign being edited and checks the list attached to it.
+app.post(['/fundraise/edit-file', '/api/fundraise/edit-file'], (req: any, res: any) => {
+    try {
+        const who = ('' + ((req.body && (req.body.user || req.body.email)) || '')).trim();
+        if (!who) return res.status(403).json({ error: 'not_signed_in', error_description: 'Sign in first.' });
+        const hit = splitCampaignPath('' + ((req.body && req.body.path) || ''));
+        if (!hit) return res.status(400).json({ error: 'bad_path' });
+        const name = ('' + ((req.body && req.body.name) || '')).trim();
+        if (!/^[A-Za-z0-9._-]+\.(fund|fundimg|fundteam)$/.test(name) || name.indexOf('..') >= 0)
+            return res.status(400).json({ error: 'bad_name' });
+        // The file being written has to belong to the campaign that was shared: its own
+        // document, or one of its two sidecars. Otherwise "share one campaign" would mean
+        // "write anything into that folder".
+        const stem = hit.name.replace(/\.fund$/i, '');
+        if (name !== hit.name && name !== stem + '.fundimg' && name !== stem + '.fundteam')
+            return res.status(400).json({ error: 'not_that_campaign', error_description: 'That file is not part of the campaign you were given.' });
+        if (!mayEditCampaign(who, hit.enc, hit.name)) {
+            return res.status(403).json({
+                error: 'not_shared_with_you',
+                error_description: 'That campaign has not been shared with this account.',
+            });
+        }
+        const dir = path.join(userData, hit.enc, 'public');
+        const full = path.join(dir, name);
+        if (!insideDir(dir, full)) return res.status(400).json({ error: 'bad_name' });
+        const value = ('' + ((req.body && req.body.value) || ''));
+        if (!value) return res.status(400).json({ error: 'no_value' });
+        if (/\.fund$/i.test(name)) {
+            try { JSON.parse(value); } catch (e) { return res.status(400).json({ error: 'not_json' }); }
+        }
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(full, value);
+        try {
+            const share = path.join(dir, '.share');
+            if (!fs.existsSync(share)) fs.writeFileSync(share, 'public\n/public');
+        } catch (e) { }
+        dropCampaignCache();
+        return res.json({ ok: true, path: '/' + hit.enc + '/public/' + name, bytes: value.length });
+    } catch (e: any) {
+        return res.status(500).json({ error: 'write_failed', error_description: e?.message || String(e) });
+    }
+});
+
+// Reading one, which the console has to do before it can edit it. /load-file serves the
+// public folder to anybody, so this adds nothing a determined reader could not already
+// get; it exists so the console has one answer-shaped route to call for a campaign it was
+// given, whatever /load-file happens to want that day.
+app.post(['/fundraise/read-file', '/api/fundraise/read-file'], (req: any, res: any) => {
+    try {
+        const who = ('' + ((req.body && (req.body.user || req.body.email)) || '')).trim();
+        const hit = splitCampaignPath('' + ((req.body && req.body.path) || ''));
+        if (!hit) return res.status(400).json({ error: 'bad_path' });
+        const name = ('' + ((req.body && req.body.name) || hit.name)).trim();
+        if (!/^[A-Za-z0-9._-]+\.(fund|fundimg|fundteam)$/.test(name) || name.indexOf('..') >= 0)
+            return res.status(400).json({ error: 'bad_name' });
+        const stem = hit.name.replace(/\.fund$/i, '');
+        if (name !== hit.name && name !== stem + '.fundimg' && name !== stem + '.fundteam')
+            return res.status(400).json({ error: 'not_that_campaign' });
+        if (!mayEditCampaign(who, hit.enc, hit.name))
+            return res.status(403).json({ error: 'not_shared_with_you', error_description: 'That campaign has not been shared with this account.' });
+        const dir = path.join(userData, hit.enc, 'public');
+        const full = path.join(dir, name);
+        if (!insideDir(dir, full) || !fs.existsSync(full)) return res.status(404).json({ error: 'not_found' });
+        return res.json({ ok: true, value: fs.readFileSync(full, 'utf-8') });
+    } catch (e: any) {
+        return res.status(500).json({ error: 'read_failed', error_description: e?.message || String(e) });
+    }
+});
+
 // EVERY CAMPAIGN A USER HAS, for the administration page (fundraise/admin.js). The folder
 // name under the user-data root is an AES encoding of the address, which the browser cannot
 // work out for itself, so the listing has to happen here.
